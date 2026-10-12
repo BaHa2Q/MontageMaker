@@ -39,11 +39,33 @@ def verify_distribution(video, report):
         studio.source_position=.3
         studio.commit_selection()
         assert len(studio.config().protected_polygons)==1
-        studio.add_effect('freeze',source=.3)
-        studio.add_effect('freeze',source=.8)
+        first=studio.add_effect('freeze',t=.2,source=.3)
+        studio.effect_length.setValue(.3)
+        studio.add_effect('freeze',t=.7,source=.8)
+        studio.effect_length.setValue(.3)
         studio.add_builtin_sound('whoosh')
         studio.add_builtin_sound('impact')
-        assert len(studio.config().effect_clips)==2 and len(studio.config().sound_effects)==2
+        assert len(studio.config().effect_clips)==2 and len([c for c in studio.audio_clips if c.get('builtin')])==2
+        canvas=studio.audio_timeline.canvas
+        import copy
+        before_video=copy.deepcopy(studio.video_clips); before_audio=copy.deepcopy(studio.audio_clips)
+        studio.select_effect(first['id']); studio.effect_length.setValue(.2)
+        assert studio.video_clips==before_video and studio.audio_clips==before_audio
+        canvas.select_item('video',studio.video_clips[0]['id'])
+        canvas.select_item('effect',first['id'],ctrl=True)
+        canvas.position=.3
+        assert canvas.split_selected() and len(studio.video_clips)==2 and len(studio.effect_clips)==3
+        canvas.undo(); assert len(studio.video_clips)==1 and len(studio.effect_clips)==2
+        canvas.set_lane_flag('motion','hidden',True)
+        assert all(c['muted'] for c in studio.config().effect_clips)
+        assert not any(c.get('muted') for c in studio.project_settings()['effect_clips'])
+        canvas.set_lane_flag('motion','hidden',False)
+        canvas.select_item('video',studio.video_clips[0]['id']); assert canvas.remove_selected()
+        assert studio.config().video_clips==[]
+        canvas.undo(); assert len(studio.video_clips)==1
+        fixed_cfg=studio.config(); fixed_cfg.out=os.path.join(os.path.dirname(report),'fixed_timeline_check.mp4')
+        fixed_cfg.output_height=360; fixed_cfg.output_fps=15; fixed_cfg.quality='draft'
+        run_montage(fixed_cfg,log=lambda message:None)
         deadline=time.monotonic()+10
         while (studio.analysis_jobs or studio.fx_jobs or studio.proxy_jobs) and time.monotonic()<deadline:
             QApplication.processEvents(); time.sleep(.02)
@@ -54,7 +76,9 @@ def verify_distribution(video, report):
         data = dict(ok=True, app=APP_DIR, ffmpeg=FFMPEG, ffprobe=FFPROBE,
                     output=info, frames=probe_frames(out), gui_playback=playback,
                     live_editor=True, selection_auto_commit=True,
-                    repeated_effects=True,builtin_sound_clips=True)
+                    repeated_effects=True,builtin_sound_clips=True,
+                    independent_effect_trim=True,mixed_split=True,editable_video_delete=True,
+                    lane_visibility_persistence=True,fixed_timeline_export=media_info(fixed_cfg.out))
     except Exception as ex:
         import traceback
         data = dict(ok=False, error=str(ex), traceback=traceback.format_exc())

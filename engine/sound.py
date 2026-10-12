@@ -166,6 +166,13 @@ def make_soundtrack(total, t_ramp, t_freeze, t_resume, orbit_end, music_path, ga
         path, start, volume = effect[:3]
         fade_in, fade_out = effect[3:5] if len(effect) >= 5 else (0, 0)
         clip = _read_wav(path)
+        rate = effect[5] if len(effect) > 5 else 1.0
+        if abs(rate - 1) > 1e-6:
+            ratio = Fraction(1 / float(rate)).limit_denominator(1000)
+            target = round(len(clip) / rate)
+            clip = signal.resample_poly(clip, ratio.numerator, ratio.denominator, axis=0)[:target]
+            if len(clip) < target:
+                clip = np.pad(clip, ((0, target - len(clip)), (0, 0)))
         offset = int(start * SR)
         if offset >= M:
             continue

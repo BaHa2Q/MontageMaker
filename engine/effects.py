@@ -39,7 +39,7 @@ def backgrounds_at(cfg, time):
     for clip in active_effects(cfg, time, 'background'):
         params = clip.get('params', {})
         result.append((replace(base, **{key: params[key] for key in keys if key in params}),
-                       time - clip.get('time', 0)))
+                       time - clip.get('animation_time', clip.get('time', 0))))
     return result
 
 
@@ -57,8 +57,8 @@ def timed_visuals(frame, cfg, time):
         kind, params = clip['kind'], clip.get('params', {})
         if kind == 'background':
             continue
-        local = time - clip.get('time', 0)
-        duration = max(.001, clip.get('duration', 1))
+        local = time - clip.get('animation_time', clip.get('time', 0))
+        duration = max(.001, clip.get('animation_duration', clip.get('duration', 1)))
         phase = min(1, max(0, local / duration))
         strength = float(params.get('strength', params.get('motion_strength', .65)))
         if kind == 'clarity':

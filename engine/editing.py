@@ -5,6 +5,7 @@ import math
 import os
 from fractions import Fraction
 from .util import FFPROBE, run
+from .video_edits import video_span, event_plan, effect_duration, validate_video_clips
 
 
 @dataclass
@@ -57,6 +58,9 @@ class Config:
     audio_tracks: list = field(default_factory=list)
     # None opens legacy projects; a list contains only the effects placed on the timeline.
     effect_clips: list | None = None
+    video_clips: list | None = None
+    timeline_duration: float | None = None
+    lane_states: dict = field(default_factory=dict)
     output_height: int = 1080
     output_fps: int = 60
     quality: str = 'high'
@@ -112,7 +116,9 @@ def validate(cfg, info):
         raise ValueError('The trim must be inside the original video and the end must follow the start.')
     if end - cfg.trim_start < 0.25:
         raise ValueError('Select at least 0.25 seconds of video.')
-    if cfg.effect_clips is None and cfg.animation and not cfg.trim_start <= cfg.freeze_time < end:
+    if cfg.video_clips is not None:
+        validate_video_clips(cfg, info)
+    if cfg.video_clips is None and cfg.effect_clips is None and cfg.animation and not cfg.trim_start <= cfg.freeze_time < end:
         raise ValueError('The freeze moment must be inside the selected trim.')
     if not 0.8 <= cfg.orbit_seconds <= 15:
         raise ValueError('Animation duration must be between 0.8 and 15 seconds.')
@@ -155,6 +161,8 @@ def validate(cfg, info):
         for key in ('source_in', 'fade_in', 'fade_out'):
             if not math.isfinite(float(item.get(key, 0))) or item.get(key, 0) < 0:
                 raise ValueError('Invalid audio trim or fade.')
+        if not _finite(item.get('rate', 1)) or not .1 <= item.get('rate', 1) <= 4:
+            raise ValueError('Audio clip playback rate must be between 10 and 400 percent.')
         if item.get('duration') is not None and (not math.isfinite(float(item['duration'])) or item['duration'] <= 0):
             raise ValueError('Invalid audio clip duration.')
     if not 0 <= cfg.background_blur <= 40 or not 0 <= cfg.background_dim <= .85:
@@ -172,9 +180,10 @@ def validate(cfg, info):
     has_background = any([cfg.background_blur, cfg.background_dim, cfg.background_desaturate,
                           cfg.background_glow, cfg.background_particles, cfg.background_template != 'none'])
     if cfg.effect_clips is not None:
-        _validate_effects(cfg, end)
+        _validate_effects(cfg, end, info)
         has_background = any(c.get('kind') == 'background' and not c.get('muted') for c in cfg.effect_clips)
-    if has_background and cfg.protected_time is not None and not cfg.trim_start <= cfg.protected_time < end:
+    protection_start, protection_end = (0, info['duration']) if cfg.video_clips is not None else (cfg.trim_start, end)
+    if has_background and cfg.protected_time is not None and not protection_start <= cfg.protected_time < protection_end:
         raise ValueError('The object selection frame must be inside the selected trim. Select it again at the freeze moment.')
     if cfg.effect_clips is None and has_background and cfg.background_scope == 'freeze' and not cfg.animation:
         raise ValueError('Enable animation or choose background effects for the whole video.')
@@ -185,6 +194,8 @@ def validate(cfg, info):
 
 def timeline(cfg, count):
     """A single frame-accurate edit plan for video, audio, and displayed timings."""
+    if cfg.video_clips is not None:
+        return event_plan(cfg, count)
     if cfg.effect_clips is not None:
         return _clip_timeline(cfg, count)
     fps = cfg.output_fps
@@ -229,7 +240,7 @@ def _finite(value):
     return math.isfinite(float(value))
 
 
-def _validate_effects(cfg, end):
+def _validate_effects(cfg, end, info=None):
     if not isinstance(cfg.effect_clips, list):
         raise ValueError('Invalid timeline effects.')
     identifiers, slow_intervals = set(), []
@@ -243,18 +254,25 @@ def _validate_effects(cfg, end):
         kind, params = clip['kind'], clip.get('params', {})
         if not isinstance(params, dict):
             raise ValueError('Invalid effect settings.')
+        if not _finite(clip.get('animation_time', 0)) or not _finite(clip.get('animation_duration', 1)) or clip.get('animation_duration', 1) <= 0:
+            raise ValueError('Invalid effect animation timing.')
         if kind in ('freeze', 'slowmo'):
             source = clip.get('source_time', cfg.trim_start)
-            if not _finite(source) or not cfg.trim_start <= source < end:
+            low, high = (0, info['duration']) if cfg.video_clips is not None else (cfg.trim_start, end)
+            if not _finite(source) or not low <= source < high:
                 raise ValueError('The effect source moment must be inside the selected video.')
+            if cfg.video_clips is not None and (not _finite(clip.get('time', 0)) or clip.get('time', 0) < 0):
+                raise ValueError('Effect times cannot be negative.')
             if kind == 'slowmo':
                 duration = clip.get('source_duration', 1)
                 speed = clip.get('speed', params.get('speed', .5))
-                if not _finite(duration) or duration <= 0 or source + duration > end + .01:
+                if not _finite(duration) or duration <= 0 or (cfg.video_clips is None and source + duration > end + .01):
                     raise ValueError('The slow-motion source interval must be inside the selected video.')
                 if not _finite(speed) or not .1 <= speed <= 1:
                     raise ValueError('Slow-motion speed must be between 10 and 100 percent.')
-                if not clip.get('muted', False):
+                if cfg.video_clips is not None and (not _finite(effect_duration(clip)) or effect_duration(clip) <= 0):
+                    raise ValueError('Slow-motion output duration must be positive.')
+                if cfg.video_clips is None and not clip.get('muted', False):
                     slow_intervals.append((source, source + duration))
             else:
                 duration = clip.get('duration', 1)
@@ -357,6 +375,8 @@ def source_frame_to_output(plan, frame, fps):
 
 def effect_span(cfg, info, clip):
     """Return output seconds for a timeline effect, including source-mapped holds."""
+    if cfg.video_clips is not None:
+        return float(clip.get('time', 0)), effect_duration(clip)
     if clip.get('kind') not in ('freeze', 'slowmo'):
         return float(clip.get('time', 0)), float(clip.get('duration', 1))
     end = cfg.trim_end if cfg.trim_end is not None else info['duration']

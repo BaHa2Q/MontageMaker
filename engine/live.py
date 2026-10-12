@@ -12,6 +12,7 @@ from .background import ProtectionTracker, polygon_mask, apply_background, enabl
 from .motion import Motion, finish
 from .templates import close_media
 from .effects import motion_config, backgrounds_at, timed_background, timed_visuals
+from .video_edits import source_output
 
 
 def edit_plan(cfg, info):
@@ -23,15 +24,19 @@ def sample_output(cfg, info, time):
     plan = edit_plan(cfg, info)
     fps = cfg.output_fps
     index = min(max(0, int(time*fps + 1e-7)), plan['total_frames']-1)
-    if cfg.effect_clips is not None:
+    if cfg.effect_clips is not None or cfg.video_clips is not None:
         segment = next(s for s in plan['segments'] if s['output_start'] <= index < s['output_end'])
         k = index - segment['output_start']
         frame = segment['source_start'] + k * segment['speed']
-        phase = 'motion' if segment['kind'] == 'freeze' else 'ramp' if segment['kind'] == 'slowmo' else 'video'
+        phase = 'motion' if segment['kind'] == 'freeze' else 'ramp' if segment['kind'] == 'slowmo' else segment['kind'] if segment['kind'] in ('gap', 'hold') else 'video'
         plan['active_segment'] = segment
         plan['active_motion'] = segment['clip'] if phase == 'motion' else None
+        plan['active_video_id'] = (segment.get('video_clip') or {}).get('id')
         if phase == 'motion':
-            plan['motion'] = segment['output_end'] - segment['output_start']
+            plan['motion'] = segment.get('motion_count', segment['output_end'] - segment['output_start'])
+            k = index - segment.get('motion_start', segment['output_start'])
+        if phase == 'gap':
+            return 0.0, phase, 0, plan
         return cfg.trim_start + frame / fps, phase, k if phase == 'motion' else 0, plan
     if not cfg.animation or index < plan['before']:
         frame, phase, k = index, 'video', 0
@@ -49,6 +54,8 @@ def sample_output(cfg, info, time):
 
 
 def source_to_output(cfg, info, source):
+    if cfg.video_clips is not None:
+        return source_output(cfg, source)
     plan = edit_plan(cfg, info)
     frame = max(0,(source-cfg.trim_start)*cfg.output_fps)
     if cfg.effect_clips is not None:
@@ -136,19 +143,21 @@ class LiveFrames(QThread):
 
     def render(self, cfg, info, t, original, height):
         source, phase, k, plan = (t,'video',0,edit_plan(cfg,info)) if original else sample_output(cfg,info,t)
+        w, h = dimensions(info,min(info['height'],height))
+        if not original and phase == 'gap':
+            return np.zeros((h, w, 3), np.uint8), 0.0
         video,decode_info=cfg.video,info
         if not original and phase!='motion' and cfg.video in self.proxies:
             proxy,proxy_info=self.proxies[cfg.video]
             if height<=proxy_info['height']: video,decode_info=proxy,proxy_info
         raw = self.read(video,decode_info,source)
-        w, h = dimensions(info,min(info['height'],height))
         frame = cv2.resize(raw,(w,h),interpolation=cv2.INTER_AREA)
         if original:
             return frame,source
         if cfg.remove_hud and cfg.hud_regions:
             mask = region_mask(frame.shape,cfg.hud_regions)
             frame = cv2.inpaint(frame,mask,max(1,round(h/360)),cv2.INPAINT_TELEA)
-        if cfg.effect_clips is not None:
+        if cfg.effect_clips is not None or cfg.video_clips is not None:
             mask = self.foreground(cfg, info, frame, source) if backgrounds_at(cfg, t) else None
             prepared = timed_background(frame, mask, cfg, t)
             if phase == 'motion':

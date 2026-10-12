@@ -15,7 +15,7 @@
 [Setup]
 AppId={{#InstallerId}
 AppName={#InstallerName}
-AppVersion=4.0
+AppVersion=4.1
 AppPublisher=Montage Maker Studio
 DefaultDirName={autopf}\Montage Maker Studio
 DefaultGroupName=Montage Maker Studio 4

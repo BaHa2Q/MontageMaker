@@ -37,6 +37,9 @@ def run_montage(cfg, log=print, progress=lambda f: None, cancel=None):
     end = validate(cfg, info)
     w, h = dimensions(info, cfg.output_height)
     fps = cfg.output_fps
+    timeline_editor = cfg.effect_clips is not None or cfg.video_clips is not None
+    source_start = 0.0 if cfg.video_clips is not None else cfg.trim_start
+    source_end = info['duration'] if cfg.video_clips is not None else end
     out = os.path.abspath(cfg.out or os.path.splitext(cfg.video)[0] + '_montage.mp4')
     os.makedirs(os.path.dirname(out), exist_ok=True)
     # Unique work folders isolate previews/exports and never overwrite the source.
@@ -63,8 +66,8 @@ def run_montage(cfg, log=print, progress=lambda f: None, cancel=None):
     try:
         log(f'Preparing selected clip · {w} × {h} · {fps} fps')
         src = os.path.join(work, 'source.mp4')
-        command([FFMPEG, '-v', 'error', '-y', '-ss', f'{cfg.trim_start:.6f}',
-                 '-i', cfg.video, '-t', f'{end - cfg.trim_start:.6f}',
+        command([FFMPEG, '-v', 'error', '-y', '-ss', f'{source_start:.6f}',
+                 '-i', cfg.video, '-t', f'{source_end - source_start:.6f}',
                  '-vf', f'scale={w}:{h}:flags=lanczos,setsar=1,fps={fps}',
                  '-an', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '12',
                  '-pix_fmt', 'yuv420p', src])
@@ -75,17 +78,17 @@ def run_montage(cfg, log=print, progress=lambda f: None, cancel=None):
         progress(0.12)
         mask = region_mask((h, w), cfg.hud_regions if cfg.remove_hud else [])
         cleaner = HUDCleaner(mask, src, cfg.hud_method, check)
-        has_background = background_enabled(cfg) if cfg.effect_clips is None else any(
-            c.get('kind') == 'background' and not c.get('muted', False) for c in cfg.effect_clips)
+        has_background = background_enabled(cfg) if not timeline_editor else any(
+            c.get('kind') == 'background' and not c.get('muted', False) for c in cfg.effect_clips or [])
         if has_background and cfg.protected_polygons:
-            anchor = (cfg.protected_time if cfg.protected_time is not None else cfg.freeze_time) - cfg.trim_start
+            anchor = (cfg.protected_time if cfg.protected_time is not None else cfg.freeze_time) - source_start
             anchor = min(max(anchor, 0), (count - 1) / fps)
             tracker = ProtectionTracker(src, cfg.protected_polygons, anchor, (h, w), check)
         cap = cv2.VideoCapture(src)
         if not cap.isOpened():
             raise RuntimeError('Could not open the prepared video.')
         freeze = None
-        legacy_animation = cfg.effect_clips is None and cfg.animation
+        legacy_animation = not timeline_editor and cfg.animation
         if legacy_animation:
             cap.set(cv2.CAP_PROP_POS_FRAMES, plan['ff'])
             ok, freeze = cap.read()
@@ -97,8 +100,8 @@ def run_montage(cfg, log=print, progress=lambda f: None, cancel=None):
         motion = Motion(freeze, cfg, plan['motion'], protected) if legacy_animation else None
         log('Creating audio mix')
         total = plan['duration']
-        game = audio(cfg.video, os.path.join(work, 'game.wav'), cfg.trim_start,
-                     end - cfg.trim_start) if cfg.game_audio and info['audio'] else None
+        game = audio(cfg.video, os.path.join(work, 'game.wav'), source_start,
+                     source_end - source_start) if cfg.game_audio and info['audio'] else None
         music = None
         if cfg.music and not cfg.music_muted:
             offset = cfg.drop_in_song - plan['resume'] if cfg.drop_in_song is not None else cfg.music_start
@@ -121,13 +124,14 @@ def run_montage(cfg, log=print, progress=lambda f: None, cancel=None):
             if item.get('muted', False) or track.get('muted',False):
                 continue
             length = min(total - item['time'], item.get('duration') or total)
+            rate = item.get('rate', 1)
             dest = audio(item['path'], os.path.join(work, f'fx_{i}.wav'),
-                         start=item.get('source_in', 0), duration=length)
-            effects.append((dest, item['time'], item['volume']*track.get('volume',1), item.get('fade_in', 0), item.get('fade_out', 0)))
-        if cfg.effect_clips is not None:
-            segments = [(s['output_start'] / fps, s['source_start'] / fps,
+                         start=item.get('source_in', 0), duration=length * rate)
+            effects.append((dest, item['time'], item['volume']*track.get('volume',1), item.get('fade_in', 0), item.get('fade_out', 0), rate))
+        if timeline_editor:
+            segments = [(s['output_start'] / fps, s['source_start'] / fps + cfg.trim_start - source_start,
                          (s['output_end'] - s['output_start']) / fps, 0, 0, s['speed'])
-                        for s in plan['segments'] if s['kind'] != 'freeze']
+                        for s in plan['segments'] if s['kind'] not in ('freeze', 'gap', 'hold')]
         elif cfg.animation:
             segments = [(0, 0, plan['ramp'], 0.01, 0.08),
                         (plan['resume'], (plan['ff'] + 1) / fps, plan['after'] / fps, 0.04, 0.1)]
@@ -139,7 +143,7 @@ def run_montage(cfg, log=print, progress=lambda f: None, cancel=None):
                         max(0.3, cfg.orbit_seconds - 0.3), music, game, segments, sound,
                         music_gain=cfg.music_volume, game_gain=cfg.game_volume,
                         fx_gain=cfg.fx_volume if cfg.builtin_fx and legacy_animation else 0,
-                        custom_effects=effects, legacy_treatment=(cfg.effect_clips is None))
+                        custom_effects=effects, legacy_treatment=not timeline_editor)
         check()
         progress(0.2)
         log('Restoring selected HUD regions and rendering animation' if mask.any() else 'Rendering montage')
@@ -169,15 +173,19 @@ def run_montage(cfg, log=print, progress=lambda f: None, cancel=None):
                 cleaned = apply_background(cleaned, protected, cfg, index / fps)
             return cleaned
 
-        if cfg.effect_clips is not None:
+        if timeline_editor:
             cached_index, cached_frame = -1, None
             for segment in plan['segments']:
                 check()
                 motion = None
                 for output_index in range(segment['output_start'], segment['output_end']):
                     check()
+                    if segment['kind'] == 'gap':
+                        send(np.zeros((h, w, 3), np.uint8), finish_frame=False)
+                        continue
                     local_index = output_index - segment['output_start']
-                    index = min(count - 1, round(segment['source_start'] + local_index * segment['speed']))
+                    source_index = segment['source_start'] + local_index * segment['speed'] + (cfg.trim_start - source_start) * fps
+                    index = max(0, min(count - 1, round(source_index)))
                     if index != cached_index:
                         if round(cap.get(cv2.CAP_PROP_POS_FRAMES)) != index:
                             cap.set(cv2.CAP_PROP_POS_FRAMES, index)
@@ -193,11 +201,11 @@ def run_montage(cfg, log=print, progress=lambda f: None, cancel=None):
                     if segment['kind'] == 'freeze':
                         if motion is None:
                             motion = Motion(frame, motion_config(cfg, segment['clip']),
-                                            segment['output_end'] - segment['output_start'])
-                        prepared = motion.frame(local_index, source_frame=prepared)
+                                            segment.get('motion_count', segment['output_end'] - segment['output_start']))
+                        prepared = motion.frame(output_index - segment.get('motion_start', segment['output_start']), source_frame=prepared)
                     send(timed_visuals(prepared, cfg, output_time), finish_frame=False)
         ramp_frames = []
-        for index in range(count) if cfg.effect_clips is None else ():
+        for index in range(count) if not timeline_editor else ():
             check()
             ok, frame = cap.read()
             if not ok:

@@ -83,7 +83,7 @@ class LiveAudio(QObject):
             entry=(player,audio,path); self.players[ident]=entry
             self.transports[ident]=_VoiceTransport()
             player.mediaStatusChanged.connect(lambda status,i=ident,p=player:self.media_ready(i,p,status))
-            if ident=='game' and hasattr(player,'setPitchCompensation'):
+            if hasattr(player,'setPitchCompensation'):
                 player.setPitchCompensation(False)
             player.setSource(QUrl.fromLocalFile(path))
         return entry
@@ -152,8 +152,9 @@ class LiveAudio(QObject):
             gain=clip['volume']*track.get('volume',1)
             if clip.get('fade_in'): gain*=min(1,max(0,elapsed/clip['fade_in']))
             if clip.get('fade_out'): gain*=min(1,max(0,(duration-elapsed)/clip['fade_out']))
-            self.sync_voice(ident,clip['path'],clip.get('source_in',0)+elapsed,gain,playing,
-                            0<=elapsed<duration and not clip.get('muted',False) and not track.get('muted',False))
+            rate=clip.get('rate',1)
+            self.sync_voice(ident,clip['path'],clip.get('source_in',0)+elapsed*rate,gain,playing,
+                            0<=elapsed<duration and not clip.get('muted',False) and not track.get('muted',False),rate)
         if self.fx_path:
             active.add('builtin')
             self.sync_voice('builtin',self.fx_path,time-self.fx_offset,cfg.fx_volume,playing,

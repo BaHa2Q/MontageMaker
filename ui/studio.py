@@ -23,6 +23,8 @@ from .audio import LiveAudio,EffectsAudio
 from .library import Library
 from .panels import Section
 from .effect_editor import EffectEditor,EFFECT_NAMES
+from .video_editor import VideoEditor
+from .icons import icon
 from engine.sound import builtin_sound
 
 
@@ -46,8 +48,9 @@ def seconds(value=0):
 def stamp(value): return f'{int(max(0,value)//60):02}:{max(0,value)%60:06.3f}'
 
 
-class StudioFeatures(EffectEditor):
+class StudioFeatures(VideoEditor,EffectEditor):
     def __init__(self):
+        self.video_clips=[]; self.lane_states={}; self.timeline_duration=None; self.syncing_video=False
         self.effect_clips=[]; self.syncing_effect=False; self.removed_assets=set()
         self.audio_clips=[]; self.audio_tracks=[]; self.selected_track_id=None; self.syncing_track=False
         self.pending_audio_track=None; self.pending_audio_time=None
@@ -58,7 +61,7 @@ class StudioFeatures(EffectEditor):
         self.proxy_jobs=[]
         self.background_color='#73e0bd'; self.loading_project=False
         super().__init__()
-        self.setWindowTitle('Montage Maker Studio 4')
+        self.setWindowTitle('Montage Maker Studio 4.1')
         self.resize(1530,1010); self.setMinimumSize(1100,820)
         self.player.stop(); self.player.setVideoSink(None)
         self.live_frames=LiveFrames(self)
@@ -72,9 +75,9 @@ class StudioFeatures(EffectEditor):
         self.refresh_timer.timeout.connect(self.request_live)
         self.fx_timer=QTimer(self); self.fx_timer.setSingleShot(True)
         self.fx_timer.timeout.connect(self.prepare_fx)
-        self.shortcut_save=QShortcut(QKeySequence('Ctrl+S'),self)
+        self.shortcut_save=QShortcut(QKeySequence('Ctrl+Shift+S'),self)
         self.shortcut_save.activated.connect(self.save_project)
-        self.shortcut_split=QShortcut(QKeySequence('Ctrl+Shift+S'),self)
+        self.shortcut_split=QShortcut(QKeySequence('Ctrl+S'),self)
         self.shortcut_split.activated.connect(self.split_audio)
         self.shortcut_left.setContext(Qt.WidgetWithChildrenShortcut)
         self.shortcut_right.setContext(Qt.WidgetWithChildrenShortcut)
@@ -130,7 +133,9 @@ class StudioFeatures(EffectEditor):
         self.show_hud=QCheckBox('إظهار ترميم HUD أثناء التحديد'); self.show_hud.toggled.connect(self.show_restore); self.show_hud.hide()
         self.hud_hint=label('عجلة الماوس للتكبير · Alt مع السحب للتحريك','muted'); box.addWidget(self.hud_hint)
         play=QHBoxLayout(); play.setDirection(QHBoxLayout.LeftToRight)
-        play.addWidget(button('◂|',lambda:self.step(-1))); self.play_btn=button('تشغيل',self.toggle_play,'play'); play.addWidget(self.play_btn); play.addWidget(button('|▸',lambda:self.step(1)))
+        prev=button('',lambda:self.step(-1)); prev.setIcon(icon('prev')); prev.setToolTip('الإطار السابق'); play.addWidget(prev)
+        self.play_btn=button('',self.toggle_play,'play'); self.play_btn.setIcon(icon('play')); self.play_btn.setToolTip('تشغيل / إيقاف · Space'); play.addWidget(self.play_btn)
+        nxt=button('',lambda:self.step(1)); nxt.setIcon(icon('next')); nxt.setToolTip('الإطار التالي'); play.addWidget(nxt)
         self.clock=label('00:00.000 / 00:00.000','muted'); self.clock.setLayoutDirection(Qt.LeftToRight); play.addWidget(self.clock); play.addStretch()
         self.master_slider=QSlider(Qt.Horizontal); self.master_slider.setRange(0,100); self.master_slider.setValue(65); self.master_slider.setMaximumWidth(65); self.master_slider.valueChanged.connect(self.master_changed); play.addWidget(label('♫','muted')); play.addWidget(self.master_slider); box.addLayout(play)
         self.master_slider.setToolTip('صوت العرض داخل المحرر')
@@ -141,9 +146,11 @@ class StudioFeatures(EffectEditor):
         self.sidebar=QTabWidget(); self.sidebar.setLayoutDirection(Qt.RightToLeft); inspector_box.addWidget(self.sidebar,1)
         self.main_splitter.addWidget(inspector); self.main_splitter.setSizes([385,735,350]); vertical.addWidget(self.main_splitter)
         bottom=QFrame(); bottom.setObjectName('card'); timeline_box=QVBoxLayout(bottom); timeline_box.setContentsMargins(8,7,8,7); timeline_box.setSpacing(4)
-        toolbar=QHBoxLayout(); toolbar.addWidget(button('+ تجميد',lambda:self.add_effect('freeze'))); toolbar.addWidget(button('+ تأثير',lambda:self.sidebar.setCurrentIndex(0))); toolbar.addWidget(button('+ صوت',self.add_fx)); toolbar.addWidget(button('+ مسار',self.add_empty_track)); toolbar.addWidget(button('تقسيم',self.split_audio)); toolbar.addWidget(button('تراجع',self.undo_audio)); toolbar.addWidget(button('إعادة',self.redo_audio))
+        toolbar=QHBoxLayout()
+        for key,tip,fn in [('undo','تراجع · Ctrl+Z',self.undo_audio),('redo','إعادة · Ctrl+Y',self.redo_audio)]:
+            b=button('',fn); b.setIcon(icon(key)); b.setToolTip(tip); b.setFixedWidth(38); toolbar.addWidget(b)
         self.summary=label('','muted'); toolbar.addWidget(self.summary,1)
-        self.cut_toggle=button('قص الأصل ▾',lambda:self.source_cut.setVisible(not self.source_cut.isVisible())); toolbar.addWidget(self.cut_toggle)
+        self.cut_toggle=button('قص الأصل',lambda:None); self.cut_toggle.hide()
         toolbar.addWidget(label('تكبير المسار','muted')); self.track_zoom=QSlider(Qt.Horizontal); self.track_zoom.setRange(100,800); self.track_zoom.setValue(100); self.track_zoom.setMaximumWidth(105); toolbar.addWidget(self.track_zoom); timeline_box.addLayout(toolbar)
         self.source_cut=QWidget(); source_box=QVBoxLayout(self.source_cut); source_box.setContentsMargins(0,0,0,0)
         self.track=self.timeline_type(); self.track.setMinimumHeight(78); self.track.setMaximumHeight(78); self.track.seek.connect(self.seek_source); self.track.startChanged.connect(lambda v:self.trim_in.setValue(v)); self.track.endChanged.connect(lambda v:self.trim_out.setValue(v)); self.track.freezeChanged.connect(self.set_freeze); source_box.addWidget(self.track)
@@ -152,9 +159,11 @@ class StudioFeatures(EffectEditor):
         trimrow.addStretch(); source_box.addWidget(self.trim_toolbar); self.source_cut.hide(); timeline_box.addWidget(self.source_cut)
         self.audio_timeline=AudioTimeline(); self.audio_timeline.scroll.setMaximumHeight(16777215); self.audio_timeline.setMinimumHeight(180)
         self.audio_timeline.canvas.clips=self.audio_clips; self.audio_timeline.canvas.tracks=self.audio_tracks; self.audio_timeline.canvas.effects=self.effect_clips
+        self.audio_timeline.canvas.video_clips=self.video_clips; self.audio_timeline.canvas.lane_states=self.lane_states
         self.audio_timeline.seek.connect(self.seek_output); self.audio_timeline.selected.connect(self.select_audio_clip); self.audio_timeline.changed.connect(self.clips_changed); self.track_zoom.valueChanged.connect(self.audio_timeline.set_zoom)
         canvas=self.audio_timeline.canvas; canvas.statusMessage.connect(lambda text:self.status.setText(text)); canvas.effectSelected.connect(self.select_effect); canvas.addEffect.connect(self.add_effect); canvas.addAudio.connect(self.add_audio_at); canvas.addTrack.connect(self.add_empty_track); canvas.trackSelected.connect(self.select_audio_track); canvas.videoSelected.connect(self.select_video)
         canvas.gameSelected.connect(self.select_game_audio); canvas.musicSelected.connect(self.select_music_audio)
+        canvas.selectedVideo.connect(self.select_video_event); canvas.selectionChanged.connect(self.timeline_selection_changed)
         canvas.trimStart.connect(lambda t:self.trim_in.setValue(min(t,self.trim_out.value()-.25))); canvas.trimEnd.connect(lambda t:self.trim_out.setValue(max(t,self.trim_in.value()+.25))); canvas.freezeHere.connect(self.set_freeze); canvas.fileDropped.connect(self.drop_asset)
         timeline_box.addWidget(self.audio_timeline,1); vertical.addWidget(bottom); vertical.setSizes([560,360])
         self.make_edit_tab(); self.make_background_tab(); self.make_audio_tab(); self.make_export_tab(); self.make_effect_tab()
@@ -182,7 +191,7 @@ class StudioFeatures(EffectEditor):
                 elif w.text()=='معاينة قبل التصدير': w.setText('عرض مباشر أثناء التحرير')
 
     def make_edit_tab(self):
-        box=self.tab('الفيديو'); trim=Section('قص الأصل',True); box.addWidget(trim)
+        box=self.tab('الفيديو'); self.make_video_properties(box); trim=Section('قص الأصل',True); box.addWidget(trim); trim.hide()
         form=QFormLayout(); self.trim_in=seconds(); self.trim_out=seconds(); self.freeze=seconds(3)
         for text,w in [('البداية',self.trim_in),('النهاية',self.trim_out)]: form.addRow(text,w); w.valueChanged.connect(self.edit_changed)
         trim.box.addLayout(form)
@@ -257,12 +266,14 @@ class StudioFeatures(EffectEditor):
         form=QFormLayout(); form.addRow('بداية الأغنية',self.music_start); form.addRow('وقت الدروب',self.drop_time); music.box.addLayout(form); music.box.addWidget(self.drop_enabled)
         self.music_volume=self.volume_control(music.box,'الموسيقى',55); self.music_mute=QCheckBox('كتم الموسيقى'); self.music_mute.toggled.connect(self.invalidate); music.box.addWidget(self.music_mute)
         self.music_start.valueChanged.connect(self.invalidate); self.drop_time.valueChanged.connect(self.invalidate); self.drop_enabled.toggled.connect(self.invalidate)
+        source.hide(); music.hide()
+        box.addWidget(button('إضافة صوت',self.add_fx))
         self.fx_table=QTableWidget(0,3); self.fx_table.hide(); box.addStretch(); self.refresh_audio_fields(); self.refresh_track_fields()
 
     def editor_menu(self):
         bar=self.menuBar(); bar.setLayoutDirection(Qt.RightToLeft)
-        files=bar.addMenu('ملف'); files.addAction('استيراد وسائط…',self.import_media); files.addAction('فتح فيديو…',self.open_video); files.addAction('فتح مشروع…',self.load_project); files.addAction('حفظ المشروع',self.save_project); files.addAction('تصدير…',lambda:self.start_job(False))
-        edit=bar.addMenu('تحرير'); edit.addAction('تراجع',self.undo_audio); edit.addAction('إعادة',self.redo_audio); edit.addAction('تقسيم الصوت عند المؤشر',self.split_audio)
+        files=bar.addMenu('ملف'); files.addAction('استيراد وسائط…',self.import_media); files.addAction('فتح فيديو…',self.open_video); files.addAction('فتح مشروع…',self.load_project); files.addAction('حفظ المشروع · Ctrl+Shift+S',self.save_project); files.addAction('تصدير…',lambda:self.start_job(False))
+        edit=bar.addMenu('تحرير'); edit.addAction('تراجع',self.undo_audio); edit.addAction('إعادة',self.redo_audio); edit.addAction('تقسيم المحدد · Ctrl+S',self.split_audio); edit.addAction('حذف المحدد',lambda:self.audio_timeline.canvas.remove_selected())
         view=bar.addMenu('عرض'); view.addAction('العرض المباشر',lambda:self.switch('live')); view.addAction('الفيديو الأصلي',lambda:self.switch('source'))
         from .help import show_help
         help_menu=bar.addMenu('مساعدة'); help_menu.addAction('طريقة الاستخدام',lambda:show_help(self)); return bar
@@ -336,20 +347,32 @@ class StudioFeatures(EffectEditor):
         if not hasattr(self,'track_name'): return
         self.syncing_track=True; track=self.audio_timeline.canvas.track_info(self.selected_track_id)
         for w in (self.track_name,self.track_volume,self.track_mute,self.track_lock): w.setEnabled(bool(track))
+        if track.get('locked'):
+            for w in (self.track_name,self.track_volume,self.track_mute): w.setEnabled(False)
         self.track_name.setText(track.get('name','')); self.track_volume.setValue(round(track.get('volume',1)*100)); self.track_mute.setChecked(track.get('muted',False)); self.track_lock.setChecked(track.get('locked',False)); self.syncing_track=False
 
     def track_fields_changed(self,*args):
         if self.syncing_track: return
         track=self.audio_timeline.canvas.track_info(self.selected_track_id)
         if not track: return
+        if track.get('locked') and self.sender() is not self.track_lock: self.refresh_track_fields(); return
         self.audio_timeline.canvas.remember(); track.update(name=self.track_name.text() or 'صوت',volume=self.track_volume.value()/100,muted=self.track_mute.isChecked(),locked=self.track_lock.isChecked())
         self.refresh_audio_fields(); self.invalidate()
 
-    def redo_audio(self): self.audio_timeline.canvas.redo()
+    def redo_audio(self):
+        if not self.busy: self.audio_timeline.canvas.redo()
 
     def config(self):
         cfg=super().config()
         cfg.effect_clips=copy.deepcopy(self.effect_clips); cfg.builtin_fx=False
+        cfg.video_clips=copy.deepcopy(self.video_clips); cfg.timeline_duration=self.timeline_duration; cfg.lane_states=copy.deepcopy(self.lane_states)
+        if self.info: cfg.trim_start=0; cfg.trim_end=self.info['duration']
+        cfg.game_audio=False; cfg.music=None
+        if self.lane_states.get('video',{}).get('hidden'):
+            for clip in cfg.video_clips: clip['muted']=True
+        for clip in cfg.effect_clips:
+            key='motion' if clip['kind'] in ('freeze','slowmo') else 'background' if clip['kind']=='background' else 'visual'
+            if self.lane_states.get(key,{}).get('hidden'): clip['muted']=True
         cfg.sound_effects=copy.deepcopy(self.audio_clips)
         cfg.audio_tracks=copy.deepcopy(self.audio_tracks)
         cfg.protected_polygons=copy.deepcopy(self.view.protected)
@@ -414,7 +437,8 @@ class StudioFeatures(EffectEditor):
         if self.busy: return
         self.pause_live()
         super().choose_video(path)
-        if not self.loading_project: self.effect_clips.clear(); self.audio_timeline.canvas.selected_effect_id=None
+        if not self.loading_project:
+            self.effect_clips.clear(); self.seed_video()
         self.audio_timeline.canvas.history.clear(); self.audio_timeline.canvas.future.clear(); self.selected_track_id=None
         self.library.add_file(self.video,'video')
         self.game_enabled.setEnabled(self.info['audio'])
@@ -482,7 +506,7 @@ class StudioFeatures(EffectEditor):
 
     def pause_live(self):
         self.live_playing=False
-        if hasattr(self,'play_btn'): self.play_btn.setText('تشغيل')
+        if hasattr(self,'play_btn'): self.play_btn.setText(''); self.play_btn.setIcon(icon('play'))
         if self.live_audio: self.live_audio.pause()
         if hasattr(self,'player'): self.player.pause()
 
@@ -497,7 +521,7 @@ class StudioFeatures(EffectEditor):
             self.switch('live')
         total=edit_plan(self.config(),self.info)['duration']
         if self.output_position>=total-.02: self.output_position=0
-        self.live_playing=True; self.last_tick=time.monotonic(); self.play_btn.setText('إيقاف'); self.request_live()
+        self.live_playing=True; self.last_tick=time.monotonic(); self.play_btn.setText(''); self.play_btn.setIcon(icon('pause')); self.request_live()
 
     def seek(self,t): self.seek_source(t)
 
@@ -652,7 +676,7 @@ class StudioFeatures(EffectEditor):
                 if old is None:
                     clip['duration']=max(.05,data['duration']-clip.get('source_in',0))
                 else:
-                    clip['duration']=min(clip['duration'],max(.05,data['duration']-clip['source_in']))
+                    clip['duration']=min(clip['duration'],max(.05,(data['duration']-clip['source_in'])/clip.get('rate',1)))
         self.refresh_audio_combo(); self.refresh_audio_fields(); self.invalidate()
 
     def add_fx(self):
@@ -693,18 +717,21 @@ class StudioFeatures(EffectEditor):
         self.clip_combo.blockSignals(True); self.clip_combo.clear()
         for i,clip in enumerate(self.audio_clips): self.clip_combo.addItem(f'{i+1} · {clip.get("display_name",os.path.basename(clip["path"]))}',clip['id'])
         index=self.clip_combo.findData(ident)
-        choose_first=bool(self.audio_clips) and self.selected_track_id is None and not self.audio_timeline.canvas.selected_effect_id
+        choose_first=False
         self.clip_combo.setCurrentIndex(index if index>=0 else (0 if choose_first else -1)); self.clip_combo.blockSignals(False)
         if choose_first and index<0: self.audio_timeline.canvas.selected_id=self.audio_clips[0]['id']
         self.audio_timeline.canvas.resize_content()
 
     def audio_combo_changed(self,index):
         if index>=0:
-            self.audio_timeline.canvas.selected_id=self.clip_combo.itemData(index)
+            self.audio_timeline.canvas.select_item('audio',self.clip_combo.itemData(index))
             self.refresh_audio_fields(); self.audio_timeline.canvas.update()
 
     def select_audio_clip(self,ident):
-        self.audio_timeline.canvas.selected_id=ident; self.audio_timeline.canvas.selected_effect_id=None
+        canvas=self.audio_timeline.canvas
+        if ('audio',ident) not in canvas.selection:
+            canvas.select_item('audio',ident); return
+        canvas.selected_id=ident
         clip=self.selected_clip()
         if clip:
             self.selected_track_id=clip.get('track'); self.inspector_caption.setText(os.path.basename(clip['path']))
@@ -719,7 +746,7 @@ class StudioFeatures(EffectEditor):
         if clip:
             length=clip.get('source_duration') or clip['source_in']+clip['duration']
             self.clip_time.setValue(clip['time']); self.clip_in.setMaximum(max(0,length-.05)); self.clip_in.setValue(clip['source_in'])
-            self.clip_out.setMaximum(length); self.clip_out.setValue(clip['source_in']+clip['duration'])
+            self.clip_out.setMaximum(length); self.clip_out.setValue(clip['source_in']+clip['duration']*clip.get('rate',1))
             self.clip_volume.setValue(round(clip['volume']*100)); self.clip_fade_in.setValue(clip.get('fade_in',0)); self.clip_fade_out.setValue(clip.get('fade_out',0))
             self.clip_mute.setChecked(clip.get('muted',False)); self.clip_lock.setChecked(clip.get('locked',False))
             for w in (self.clip_time,self.clip_in,self.clip_out): w.setEnabled(not self.audio_timeline.canvas.locked(clip))
@@ -729,24 +756,26 @@ class StudioFeatures(EffectEditor):
         if self.syncing_clip: return
         clip=self.selected_clip()
         if not clip: return
+        if self.audio_timeline.canvas.track_info(clip.get('track')).get('locked'): self.refresh_audio_fields(); return
+        if clip.get('locked') and self.sender() is not self.clip_lock: self.refresh_audio_fields(); return
         self.audio_timeline.canvas.remember()
         length=clip.get('source_duration') or clip['source_in']+clip['duration']
         start=min(max(0,self.clip_in.value()),max(0,length-.05))
         end=min(length,max(start+.05,self.clip_out.value()))
-        clip.update(time=self.clip_time.value(),source_in=start,duration=end-start,
+        clip.update(time=self.clip_time.value(),source_in=start,duration=(end-start)/clip.get('rate',1),
                     volume=self.clip_volume.value()/100,fade_in=self.clip_fade_in.value(),fade_out=self.clip_fade_out.value(),
                     muted=self.clip_mute.isChecked(),locked=self.clip_lock.isChecked())
         self.refresh_audio_fields(); self.invalidate()
 
     def clips_changed(self):
-        self.refresh_audio_combo(); self.refresh_audio_fields(); self.refresh_track_fields(); self.refresh_effect_combo(); self.refresh_effect_fields(); self.invalidate()
+        self.refresh_audio_combo(); self.refresh_audio_fields(); self.refresh_track_fields(); self.refresh_effect_combo(); self.refresh_effect_fields(); self.refresh_video_fields(); self.invalidate()
 
     def split_audio(self):
-        if self.audio_timeline.canvas.split():
-            self.refresh_audio_combo(); self.refresh_audio_fields(); self.invalidate()
-        else: self.status.setText('حدّد مقطع الصوت وضع المؤشر داخله لتقسيمه.')
+        if self.busy: return
+        if self.audio_timeline.canvas.split_selected(): self.clips_changed()
 
-    def undo_audio(self): self.audio_timeline.canvas.undo()
+    def undo_audio(self):
+        if not self.busy: self.audio_timeline.canvas.undo()
 
     def remove_fx(self):
         clip=self.selected_clip()
@@ -756,8 +785,7 @@ class StudioFeatures(EffectEditor):
         self.clips_changed()
 
     def pick_music(self):
-        super().pick_music()
-        if self.music_path: self.analyze(self.music_path)
+        self.add_fx()
 
     def prepare_fx(self):
         if not self.info or not self.live_audio or self.loading_project: return
@@ -786,6 +814,7 @@ class StudioFeatures(EffectEditor):
         super().set_busy(busy)
         self.library.setEnabled(not busy)
         self.audio_timeline.setEnabled(not busy); self.track_zoom.setEnabled(not busy)
+        self.audio_timeline.canvas.enabled_edit=not busy
         self.finish_object_btn.setEnabled(not busy); self.selection_actions.setEnabled(not busy)
         self.play_btn.setEnabled(not busy); self.draft_btn.setEnabled(not busy and bool(self.video))
         self.trim_toolbar.setEnabled(not busy)
@@ -797,7 +826,7 @@ class StudioFeatures(EffectEditor):
         self.commit_selection()
         path,_=QFileDialog.getSaveFileName(self,'حفظ المشروع',str(Path(self.video).with_suffix('.montage.json')),'Montage project (*.montage.json)')
         if path:
-            with open(path,'w',encoding='utf-8') as handle: json.dump({'version':4,'settings':dataclasses.asdict(self.config()),'assets':list(self.library.assets)},handle,ensure_ascii=False,indent=2)
+            with open(path,'w',encoding='utf-8') as handle: json.dump({'version':5,'settings':self.project_settings(),'assets':list(self.library.assets)},handle,ensure_ascii=False,indent=2)
             self.status.setText('تم حفظ المشروع مع مسارات الصوت والتحديدات والقوالب.')
 
     def load_project(self):
@@ -825,7 +854,8 @@ class StudioFeatures(EffectEditor):
         self.pause_live(); self.loading_project=True
         try:
             self.choose_video(cfg.video)
-            self.effect_clips[:]=copy.deepcopy(cfg.effect_clips) if cfg.effect_clips is not None else self.legacy_effects(cfg)
+            restored_audio,restored_tracks=self.migrate_timeline(cfg)
+            self.audio_timeline.canvas.clear_selection()
             self.audio_timeline.canvas.selected_effect_id=None
             self.trim_in.setValue(cfg.trim_start); self.trim_out.setValue(cfg.trim_end if cfg.trim_end is not None else self.info['duration'])
             self.freeze.setValue(cfg.freeze_time); self.motion_duration.setValue(cfg.orbit_seconds); self.angle.setValue(cfg.orbit_angle)
@@ -844,13 +874,15 @@ class StudioFeatures(EffectEditor):
             self.music_mute.setChecked(cfg.music_muted)
             self.builtin_fx.setChecked(False); self.fx_volume.setValue(round(cfg.fx_volume*100))
             self.audio_clips.clear()
-            self.audio_tracks.clear(); self.audio_tracks.extend(copy.deepcopy(cfg.audio_tracks))
-            for item in cfg.sound_effects: self.fx_row(item['path'],item['time'],item['volume']*100,item)
+            self.audio_tracks.clear(); self.audio_tracks.extend(restored_tracks)
+            for item in restored_audio: self.fx_row(item['path'],item['time'],item['volume']*100,item)
             if cfg.effect_clips is None and cfg.animation and cfg.builtin_fx:
                 path,title,duration=builtin_sound('freeze_mix'); old_plan=edit_plan(cfg,self.info)
                 self.fx_row(path,max(0,old_plan['ramp']-.1),cfg.fx_volume*100,item=dict(duration=duration,source_duration=duration,builtin='freeze_mix',display_name=title))
             if cfg.music: self.analyze(cfg.music)
-            self.resolution.setCurrentIndex(self.resolution.findData(cfg.output_height)); self.fps.setCurrentIndex(self.fps.findData(cfg.output_fps)); self.quality.setCurrentIndex(self.quality.findData(cfg.quality))
+            for combo,value,title in [(self.resolution,cfg.output_height,f'{cfg.output_height}p'),(self.fps,cfg.output_fps,f'{cfg.output_fps} fps'),(self.quality,cfg.quality,cfg.quality)]:
+                if combo.findData(value)<0: combo.addItem(title,value)
+                combo.setCurrentIndex(combo.findData(value))
             self.selected_track_id=None; self.refresh_effect_combo(); self.refresh_effect_fields(); self.refresh_audio_combo(); self.refresh_audio_fields(); self.refresh_track_fields(); self.output_position=source_to_output(self.config(),self.info,cfg.freeze_time)
             self.source_position=cfg.freeze_time; self.mode='live'; self.view.source=False
         finally: self.loading_project=False
@@ -876,14 +908,15 @@ class StudioFeatures(EffectEditor):
         self.commit_selection()
         try:
             os.makedirs(CACHE_DIR,exist_ok=True)
-            path=os.path.join(CACHE_DIR,'session_v4.json'); temp=path+'.tmp'
-            data={'version':4,'settings':dataclasses.asdict(self.config()),'position':self.output_position,'assets':list(self.library.assets)}
+            path=os.path.join(CACHE_DIR,'session_v41.json'); temp=path+'.tmp'
+            data={'version':5,'settings':self.project_settings(),'position':self.output_position,'assets':list(self.library.assets)}
             with open(temp,'w',encoding='utf-8') as handle: json.dump(data,handle,ensure_ascii=False)
             os.replace(temp,path)
         except OSError: pass
 
     def restore_session(self):
-        path=os.path.join(CACHE_DIR,'session_v4.json')
+        path=os.path.join(CACHE_DIR,'session_v41.json')
+        if not os.path.isfile(path): path=os.path.join(CACHE_DIR,'session_v4.json')
         if not os.path.isfile(path): path=os.path.join(CACHE_DIR,'session_v3.json')
         if not os.path.isfile(path) or self.video: return
         try:

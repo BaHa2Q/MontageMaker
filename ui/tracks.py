@@ -7,10 +7,12 @@ import subprocess
 import uuid
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, Signal, QThread, QRectF, QPointF
+from PySide6.QtCore import Qt, Signal, QThread, QRectF, QRect, QPointF
 from PySide6.QtGui import QPainter, QColor, QPen, QPainterPath, QImage, QFont, QPixmap
 from PySide6.QtWidgets import QWidget, QScrollArea, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QSlider,QMenu
 from engine.util import FFMPEG, FFPROBE, run, popen
+from .timeline_ops import TimelineOperations
+from .icons import icon
 
 
 EFFECT_NAMES = {
@@ -62,7 +64,7 @@ class MediaAnalysis(QThread):
         except Exception as ex: self.failed.emit(self.path,str(ex))
 
 
-class TrackCanvas(QWidget):
+class TrackCanvas(TimelineOperations,QWidget):
     seek=Signal(float)
     selected=Signal(str)
     changed=Signal()
@@ -81,6 +83,8 @@ class TrackCanvas(QWidget):
     effectSelected=Signal(str)
     addEffect=Signal(str,float)
     statusMessage=Signal(str)
+    selectedVideo=Signal(str)
+    selectionChanged=Signal()
 
     HEADER=142
     ROW=52
@@ -89,6 +93,7 @@ class TrackCanvas(QWidget):
         super().__init__(parent)
         self.duration,self.position=1,0
         self.clips=[]; self.tracks=[]; self.effects=[]; self.selected_id=None; self.selected_effect_id=None
+        self.video_clips=None; self.selected_video_id=None; self.selection=set(); self.lane_states={}
         self.waveforms={}; self.thumbnails=[]
         self.video_cfg=None; self.game_audio=True; self.game_wave=[]
         self.music=None
@@ -103,13 +108,20 @@ class TrackCanvas(QWidget):
         self.history.append(self.snapshot()); self.history=self.history[-100:]; self.future=[]
 
     def snapshot(self):
-        return copy.deepcopy({'clips':self.clips,'tracks':self.tracks,'effects':self.effects})
+        return copy.deepcopy({'clips':self.clips,'tracks':self.tracks,'effects':self.effects,'video_clips':self.video_clips,
+                              'lane_states':self.lane_states,'selection':self.selection,
+                              'selected_id':self.selected_id,'selected_effect_id':self.selected_effect_id,'selected_video_id':self.selected_video_id})
 
     def restore(self,data):
         self.clips[:]=data['clips']; self.tracks[:]=data['tracks']; self.effects[:]=data.get('effects',[])
-        if self.selected_id and not any(c['id']==self.selected_id for c in self.clips): self.selected_id=None
-        if self.selected_effect_id and not any(c['id']==self.selected_effect_id for c in self.effects):
-            self.selected_effect_id=None; self.effectSelected.emit('')
+        videos=data.get('video_clips')
+        if videos is None: self.video_clips=None
+        elif self.video_clips is None: self.video_clips=copy.deepcopy(videos)
+        else: self.video_clips[:]=videos
+        self.lane_states.clear(); self.lane_states.update(data.get('lane_states',{}))
+        self.selection=set(data.get('selection',set()))
+        self.selected_id=data.get('selected_id'); self.selected_effect_id=data.get('selected_effect_id'); self.selected_video_id=data.get('selected_video_id')
+        self.sync_selection()
         self.changed.emit(); self.resize_content()
 
     def undo(self):
@@ -122,9 +134,11 @@ class TrackCanvas(QWidget):
 
     def extent(self):
         return max(.1,self.duration,max((c['time']+c['duration'] for c in self.clips),default=0),
+                   max((sum(self.video_span(c)) for c in self.video_clips or []),default=0),
                    max((sum(self.effect_span(c)) for c in self.effects),default=0))
 
     def effect_span(self,clip):
+        if self.fixed_video_mode(): return max(0,float(clip.get('time',0))),max(.05,float(clip.get('duration',1)))
         if self.video_cfg:
             try:
                 from engine.editing import effect_span
@@ -167,7 +181,8 @@ class TrackCanvas(QWidget):
 
     def effect_at(self,pos):
         if pos.x()<self.HEADER: return None
-        return next((c for c in reversed(self.effects) if self.effect_rect(c).adjusted(-4,0,4,0).contains(pos)),None)
+        candidates=[c for c in reversed(self.effects) if not self.item_hidden('effect',c)]
+        return next((c for c in candidates if self.effect_rect(c).contains(pos)),None) or next((c for c in candidates if self.effect_rect(c).adjusted(-4,0,4,0).contains(pos)),None)
 
     def scale(self):
         if getattr(self,'_render_scale',None) is not None: return self._render_scale
@@ -186,16 +201,93 @@ class TrackCanvas(QWidget):
     def clip_row(self,index):
         ids=self.track_ids(); ident=self.clips[index].get('track',index)
         return self.lane_y(ids.index(ident))
-    def lane_y(self,index): return self.video_y()+self.ROW*(index+2+(1 if self.music else 0))
+    def audio_offset(self): return 1 if self.fixed_video_mode() else 2+(1 if self.music else 0)
+    def lane_y(self,index): return self.video_y()+self.ROW*(index+self.audio_offset())
     def lane_at(self,y):
         if y<self.video_y(): return None
-        index=int((y-self.video_y())/self.ROW)-2-(1 if self.music else 0)
+        index=int((y-self.video_y())/self.ROW)-self.audio_offset()
         ids=self.track_ids(); return ids[index] if 0<=index<len(ids) else None
 
     def locked(self,clip): return clip.get('locked',False) or self.track_info(clip.get('track')).get('locked',False)
 
+    def group_lane_at(self,y):
+        for index,(begin,height,*_) in enumerate(self.effect_layout()):
+            if begin<=y<begin+height: return ('motion','visual','background')[index]
+        if self.video_y()<=y<self.video_y()+self.ROW: return 'video'
+        if not self.fixed_video_mode() and self.game_y()<=y<self.game_y()+self.ROW: return 'game'
+        if not self.fixed_video_mode() and self.music and self.music_y()<=y<self.music_y()+self.ROW: return 'music'
+        return None
+
+    def event_under_pointer(self,pos):
+        effect=self.effect_at(pos)
+        if effect: return 'effect',effect,self.effect_rect(effect)
+        video=self.video_at(pos)
+        if video: return 'video',video,self.video_rect(video)
+        for tolerance in (0,4):
+            for index,clip in reversed(list(enumerate(self.clips))):
+                rect=QRectF(self.x(clip['time']),self.clip_row(index)+2,max(3,clip['duration']*self.scale()),self.ROW-10)
+                if rect.adjusted(-tolerance,0,tolerance,0).contains(pos): return 'audio',clip,rect
+        return None,None,None
+
+    def hover_cursor(self,pos):
+        if pos.x()<self.HEADER:
+            self.setCursor(Qt.PointingHandCursor if pos.x()>=self.HEADER-48 else Qt.ArrowCursor)
+            if self.HEADER-48<=pos.x()<self.HEADER-28: self.setToolTip('إخفاء / إظهار المسار')
+            elif self.HEADER-28<=pos.x()<self.HEADER-5: self.setToolTip('قفل / فتح المسار')
+            else: self.setToolTip('')
+            return
+        kind,clip,rect=self.event_under_pointer(pos)
+        if clip and not self.item_locked(kind,clip):
+            edge=abs(pos.x()-rect.left())<8 or abs(pos.x()-rect.right())<8
+            self.setCursor(Qt.SizeHorCursor if edge else Qt.OpenHandCursor)
+            self.setToolTip('اسحب الطرف لتحديد البداية أو النهاية' if edge else 'اسحب للتحريك؛ Ctrl + كليك لتحديد أكثر من مقطع')
+        else: self.setCursor(Qt.ArrowCursor); self.setToolTip('')
+
+    def paint_drag_overlay(self,p):
+        overlay=getattr(self,'drag_overlay',None)
+        if not self.drag or not overlay or overlay[2]=='move': return
+        kind,ident,edge=overlay; clip=self.item(kind,ident)
+        if not clip: return
+        start,duration=self.video_span(clip) if kind=='video' else self.effect_span(clip) if kind=='effect' else (clip['time'],clip['duration'])
+        rect=self.video_rect(clip) if kind=='video' else self.effect_rect(clip) if kind=='effect' else QRectF(self.x(start),self.clip_row(self.clips.index(clip)),duration*self.scale(),self.ROW)
+        boundary=start if edge=='left' else start+duration
+        label=f'{"البداية" if edge=="left" else "النهاية"}: {boundary:.2f} ث   |   المدة: {duration:.2f} ث'
+        p.setPen(QPen(QColor('#ffe3a2'),2)); p.drawLine(QPointF(self.x(boundary),rect.top()-5),QPointF(self.x(boundary),rect.bottom()+5))
+        width=min(330,max(160,self.width()-self.HEADER-10)); x=max(self.HEADER,min(self.x(boundary)-width/2,self.width()-width-6)); y=max(1,rect.top()-30)
+        bubble=QRectF(x,y,width,27); p.setBrush(QColor('#18283c')); p.setPen(QPen(QColor('#ffe3a2'),1)); p.drawRoundedRect(bubble,5,5)
+        p.setPen(QColor('#f5efdf')); p.drawText(bubble.adjusted(8,1,-8,-1),Qt.AlignCenter,label)
+
+    def move_group(self,delta):
+        group=getattr(self,'drag_group',[])
+        if not group: return
+        delta=max(delta,-min(span[0] for _,_,span in group))
+        for kind,old,span in group:
+            clip=self.item(kind,old['id'])
+            if clip is None or self.item_locked(kind,clip): continue
+            if kind=='effect' and not self.fixed_video_mode() and old.get('kind') in ('freeze','slowmo'):
+                clip['source_time']=self.source_for_output(span[0]+delta)
+            else: clip['time']=old.get('time',span[0])+delta
+            if kind=='effect' and 'animation_time' in old: clip['animation_time']=old['animation_time']+delta
+
+    def drag_video(self,time):
+        _,ident,edge,begin,old,span=self.drag
+        clip=self.item('video',ident)
+        if clip is None or self.item_locked('video',clip): return
+        start,duration=span; delta=time-begin; speed=old.get('speed',1)
+        if abs(delta)<.0001: return
+        self.remember_drag()
+        if edge=='move': self.move_group(delta)
+        elif edge=='left':
+            delta=max(-old.get('time',0),-old['source_in']/speed if speed else -float('inf'),min(delta,duration-.05))
+            clip['time']=old.get('time',0)+delta; clip['source_in']=old['source_in']+delta*speed; clip['duration']=old['duration']-delta
+        else:
+            available=(self.video_cfg[1]['duration']-old['source_in'])/speed if self.video_cfg and speed else float('inf')
+            clip['duration']=max(.05,min(duration+delta,available))
+        self.changed.emit(); self.update()
+
     def resize_content(self):
-        self.setFixedSize(max(450,round(self.available*self.zoom)),self.video_y()+self.ROW*(3+len(self.track_ids())+(1 if self.music else 0))+12)
+        width=self.width() if self.drag else max(450,round(self.available*self.zoom))
+        self.setFixedSize(width,self.video_y()+self.ROW*(self.audio_offset()+1+len(self.track_ids()))+12)
         self.update()
 
     def wave(self,p,rect,path,source_in,duration,source_length,color):
@@ -209,32 +301,36 @@ class TrackCanvas(QWidget):
                 amp=min(1,wave[idx])*rect.height()*.43
                 p.drawLine(QPointF(rect.x()+k,rect.center().y()-amp),QPointF(rect.x()+k,rect.center().y()+amp))
 
-    def row(self,p,y,label,color,muted=False,locked=False):
-        p.fillRect(QRectF(4,y,self.HEADER-10,self.ROW-6),QColor('#162131'))
+    def row(self,p,y,label,color,muted=False,locked=False,key=None,height=None):
+        state=self.lane_state(key) if key else {}
+        hidden=state.get('hidden',False) or muted; locked=state.get('locked',False) or locked
+        height=height or self.ROW
+        p.fillRect(QRectF(4,y,self.HEADER-10,height-6),QColor('#162131'))
         p.setPen(QColor(color)); p.drawText(QRectF(12,y+7,self.HEADER-55,22),Qt.AlignVCenter,label)
         p.setPen(QColor('#b9c6da'))
-        p.drawText(QRectF(self.HEADER-44,y+7,18,20),Qt.AlignCenter,'×' if muted else '♫')
-        p.drawText(QRectF(self.HEADER-23,y+7,15,20),Qt.AlignCenter,'▣' if locked else '□')
+        icon('eye-off' if hidden else 'eye',16,'#f1ba75' if hidden else '#b9c6da').paint(p,QRect(self.HEADER-46,int(y)+9,17,17))
+        icon('lock' if locked else 'unlock',16,'#f1ba75' if locked else '#b9c6da').paint(p,QRect(self.HEADER-25,int(y)+9,17,17))
 
     def paint_effects(self,p):
-        for y,height,label,color,events in self.effect_layout():
-            p.fillRect(QRectF(4,y,self.HEADER-10,height-6),QColor('#162131'))
-            p.setPen(QColor(color)); p.drawText(QRectF(12,y+8,self.HEADER-24,22),Qt.AlignVCenter,label)
+        for family_index,(y,height,label,color,events) in enumerate(self.effect_layout()):
+            key=('motion','visual','background')[family_index]
+            self.row(p,y,label,color,key=key,height=height)
             p.setPen(QColor('#788ba6')); p.drawText(QRectF(12,y+30,self.HEADER-24,14),Qt.AlignVCenter,'كلك يمين للإضافة')
             if not events:
                 p.setPen(QColor('#657995')); p.drawText(QRectF(self.HEADER+10,y+5,self.width()-self.HEADER-20,32),Qt.AlignVCenter,'أضف تأثيرًا وحدد مدته من الشريط')
             for clip,start,duration,slot in events:
                 rect=QRectF(self.x(start),y+5+slot*36,max(3,duration*self.scale()),32)
-                selected=clip.get('id')==self.selected_effect_id
+                selected=self.is_selected('effect',clip.get('id'))
                 p.setBrush(QColor('#202838') if clip.get('muted',False) else QColor(color).darker(245))
                 p.setPen(QPen(QColor('#ffffff' if selected else color),2 if selected else 1))
                 p.drawRoundedRect(rect,5,5)
                 p.save(); p.setClipRect(rect)
+                if self.item_hidden('effect',clip): p.setOpacity(.2)
                 p.setPen(QColor('#8290a6' if clip.get('muted',False) else '#eef2fa'))
                 name=clip.get('name') or EFFECT_NAMES.get(clip.get('kind'),clip.get('kind','تأثير'))
-                suffix='  ▣' if clip.get('locked') else ''
-                p.drawText(rect.adjusted(8,2,-8,-2),Qt.AlignVCenter,name+suffix)
-                if selected and not clip.get('locked'):
+                p.drawText(rect.adjusted(8,2,-8,-2),Qt.AlignVCenter,name)
+                if self.item_locked('effect',clip): icon('lock',14).paint(p,QRect(int(rect.right()-19),int(rect.top()+8),14,14))
+                if selected and not self.item_locked('effect',clip):
                     p.fillRect(QRectF(rect.x(),rect.y()+6,4,rect.height()-12),QColor('#f6f3ff'))
                     p.fillRect(QRectF(rect.right()-4,rect.y()+6,4,rect.height()-12),QColor('#f6f3ff'))
                 p.restore()
@@ -243,7 +339,7 @@ class TrackCanvas(QWidget):
         # Playback changes only the playhead. Cache thumbnails, waveforms and events
         # so waveform painting cannot starve the audio player's event loop.
         ratio=self.devicePixelRatioF()
-        signature=(self.width(),self.height(),ratio,self.duration,repr(self.clips),repr(self.tracks),repr(self.effects),
+        signature=(self.width(),self.height(),ratio,self.duration,repr(self.clips),repr(self.tracks),repr(self.effects),repr(self.video_clips),repr(self.lane_states),repr(sorted(self.selection)),
                    self.selected_id,self.selected_effect_id,repr(self.video_cfg),self.game_audio,
                    repr(self.music),id(self.game_wave),id(self.thumbnails),
                    tuple((path,id(values),len(values)) for path,values in self.waveforms.items()))
@@ -263,6 +359,7 @@ class TrackCanvas(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
         x=self.x(self.position); p.setPen(QPen(QColor('#ff697e'),2)); p.drawLine(QPointF(x,0),QPointF(x,self.height()))
         p.setBrush(QColor('#ff697e')); p.drawEllipse(QPointF(x,26),3,3)
+        self.paint_drag_overlay(p)
 
     def media_sample(self,time):
         cfg,info=self.video_cfg
@@ -271,7 +368,7 @@ class TrackCanvas(QWidget):
             index=min(max(0,int(time*cfg.output_fps+1e-7)),plan['total_frames']-1)
             segment=next(s for s in plan['segments'] if s['output_start']<=index<s['output_end'])
             source=cfg.trim_start+(segment['source_start']+(index-segment['output_start'])*segment['speed'])/cfg.output_fps
-            return source,'motion' if segment['kind']=='freeze' else 'ramp' if segment['kind']=='slowmo' else 'video'
+            return source,'motion' if segment['kind']=='freeze' else 'ramp' if segment['kind']=='slowmo' else segment['kind'] if segment['kind'] in ('gap','hold') else 'video'
         from engine.live import sample_output
         return sample_output(cfg,info,time)[:2]
 
@@ -285,37 +382,46 @@ class TrackCanvas(QWidget):
             p.setPen(QColor('#91a2ba')); p.drawText(QRectF(x+3,1,70,24),Qt.AlignVCenter,f'{int(t//60):02}:{t%60:04.1f}')
         self.paint_effects(p)
         video_y=self.video_y()
-        self.row(p,video_y,'الفيديو','#5ea7ff',locked=True)
-        rect=QRectF(self.x(0),video_y+2,max(2,self.duration*self.scale()),self.ROW-10)
-        p.setClipRect(rect)
-        if self.thumbnails:
-            for x in range(int(rect.x()),int(rect.right())+1,96):
-                out_t=self.time(x)
-                source=out_t
-                if self.video_cfg:
-                    source=self.media_sample(out_t)[0]
-                img=min(self.thumbnails,key=lambda pair:abs(pair[0]-source))[1]
-                p.drawImage(QRectF(x,rect.y(),96,rect.height()),img)
-        p.setClipping(False); p.setBrush(Qt.NoBrush); p.setPen(QPen(QColor('#5ea7ff'),1.5)); p.drawRoundedRect(rect,5,5)
-        y=self.game_y()
-        self.row(p,y,'صوت الفيديو','#37ddbf',not self.game_audio,True)
-        rect=QRectF(self.x(0),y+2,max(2,self.duration*self.scale()),self.ROW-10)
-        p.fillRect(rect,QColor('#11352f') if self.game_audio else QColor('#19222d'))
-        if self.game_wave and self.video_cfg:
-            cfg,info=self.video_cfg
-            p.setPen(QColor('#34d9b5'))
-            for k in range(max(1,int(rect.width()))):
-                source,phase=self.media_sample(k/self.scale())
-                idx=min(len(self.game_wave)-1,max(0,int(source/info['duration']*len(self.game_wave))))
-                amp=0 if phase=='motion' else min(1,self.game_wave[idx])*17
-                p.drawLine(QPointF(rect.x()+k,rect.center().y()-amp),QPointF(rect.x()+k,rect.center().y()+amp))
-        p.setPen(QColor('#37ddbf')); p.drawRoundedRect(rect,5,5)
-        if self.music:
-            y=self.music_y(); self.row(p,y,'الموسيقى','#d495ff',self.music.get('muted',False),True)
+        self.row(p,video_y,'الفيديو','#5ea7ff',key='video')
+        video_events=self.video_clips if self.fixed_video_mode() else [None]
+        for clip in video_events:
+            start,duration=self.video_span(clip) if clip else (0,self.duration)
+            rect=QRectF(self.x(start),video_y+2,max(3,duration*self.scale()),self.ROW-10)
+            selected=clip and self.is_selected('video',clip['id'])
+            p.fillRect(rect,QColor('#152941')); p.save(); p.setClipRect(rect)
+            if self.lane_state('video').get('hidden') or clip and clip.get('muted'): p.setOpacity(.2)
+            if self.thumbnails:
+                for x in range(int(rect.x()),int(rect.right())+1,96):
+                    out_t=self.time(x)
+                    source=(clip['source_in']+(out_t-start)*clip.get('speed',1)) if clip else self.media_sample(out_t)[0] if self.video_cfg else out_t
+                    img=min(self.thumbnails,key=lambda pair:abs(pair[0]-source))[1]
+                    p.drawImage(QRectF(x,rect.y(),96,rect.height()),img)
+            if clip:
+                p.fillRect(QRectF(rect.x()+3,rect.y()+2,min(150,rect.width()-6),17),QColor(13,17,29,175))
+                p.setPen(QColor('#e6edf8')); p.drawText(rect.adjusted(7,1,-7,-20),Qt.AlignVCenter,clip.get('name') or 'الفيديو')
+            p.restore(); p.setBrush(Qt.NoBrush); p.setPen(QPen(QColor('#ffffff' if selected else '#5ea7ff'),2 if selected else 1.5)); p.drawRoundedRect(rect,5,5)
+            if selected and not self.item_locked('video',clip):
+                p.fillRect(QRectF(rect.x(),rect.y()+7,4,rect.height()-14),QColor('#f6f3ff')); p.fillRect(QRectF(rect.right()-4,rect.y()+7,4,rect.height()-14),QColor('#f6f3ff'))
+        if not self.fixed_video_mode():
+            y=self.game_y()
+            self.row(p,y,'صوت الفيديو','#37ddbf',not self.game_audio,key='game')
             rect=QRectF(self.x(0),y+2,max(2,self.duration*self.scale()),self.ROW-10)
-            p.fillRect(rect,QColor('#34233f'))
-            self.wave(p,rect,self.music['path'],self.music.get('source_in',0),self.duration,self.music.get('source_duration',self.duration),'#d495ff')
-            p.setPen(QColor('#d495ff')); p.drawRoundedRect(rect,5,5)
+            p.fillRect(rect,QColor('#11352f') if self.game_audio else QColor('#19222d'))
+            if self.game_wave and self.video_cfg:
+                cfg,info=self.video_cfg
+                p.setPen(QColor('#34d9b5'))
+                for k in range(max(1,int(rect.width()))):
+                    source,phase=self.media_sample(k/self.scale())
+                    idx=min(len(self.game_wave)-1,max(0,int(source/info['duration']*len(self.game_wave))))
+                    amp=0 if phase not in ('video','ramp') else min(1,self.game_wave[idx])*17
+                    p.drawLine(QPointF(rect.x()+k,rect.center().y()-amp),QPointF(rect.x()+k,rect.center().y()+amp))
+            p.setPen(QColor('#37ddbf')); p.drawRoundedRect(rect,5,5)
+            if self.music:
+                y=self.music_y(); self.row(p,y,'الموسيقى','#d495ff',self.music.get('muted',False),key='music')
+                rect=QRectF(self.x(0),y+2,max(2,self.duration*self.scale()),self.ROW-10)
+                p.fillRect(rect,QColor('#34233f'))
+                self.wave(p,rect,self.music['path'],self.music.get('source_in',0),self.duration,self.music.get('source_duration',self.duration),'#d495ff')
+                p.setPen(QColor('#d495ff')); p.drawRoundedRect(rect,5,5)
         colors=['#a99aff','#66c8ff','#f3b878','#ea89bb','#75e0b5']
         for i,ident in enumerate(self.track_ids()):
             track=self.track_info(ident); self.row(p,self.lane_y(i),track.get('name',f'صوت {i+1}'),colors[i%len(colors)],track.get('muted',False),track.get('locked',False))
@@ -323,13 +429,14 @@ class TrackCanvas(QWidget):
             y=self.clip_row(i); color=colors[self.track_ids().index(clip.get('track',i))%len(colors)]
             r=QRectF(self.x(clip['time']),y+2,max(3,clip['duration']*self.scale()),self.ROW-10)
             p.setBrush(QColor('#1e273c') if clip.get('muted') or self.track_info(clip.get('track')).get('muted') else QColor('#342c57'))
-            p.setPen(QPen(QColor('#ffffff' if clip['id']==self.selected_id else color),2 if clip['id']==self.selected_id else 1))
+            selected=self.is_selected('audio',clip['id'])
+            p.setPen(QPen(QColor('#ffffff' if selected else color),2 if selected else 1))
             p.drawRoundedRect(r,5,5)
             p.save(); p.setClipRect(r)
-            self.wave(p,r,clip['path'],clip.get('source_in',0),clip['duration'],clip.get('source_duration') or clip['duration'],color)
+            self.wave(p,r,clip['path'],clip.get('source_in',0),clip['duration']*clip.get('rate',1),clip.get('source_duration') or clip['duration'],color)
             p.fillRect(QRectF(r.x()+3,r.y()+2,min(150,r.width()-6),17),QColor(13,17,29,170))
             p.setPen(QColor('#e6edf8')); p.drawText(QRectF(r.x()+6,r.y()+2,r.width()-12,17),Qt.AlignVCenter,clip.get('display_name') or clip.get('name') or os.path.basename(clip['path']))
-            if clip['id']==self.selected_id:
+            if selected and not self.locked(clip):
                 p.fillRect(QRectF(r.x(),r.y()+7,5,r.height()-14),QColor('#f6f3ff'))
                 p.fillRect(QRectF(r.right()-5,r.y()+7,5,r.height()-14),QColor('#f6f3ff'))
             p.restore()
@@ -341,84 +448,97 @@ class TrackCanvas(QWidget):
         if not self.enabled_edit: return
         if event.button()==Qt.RightButton:
             self.context(event.position().toPoint()); return
+        if x<self.HEADER:
+            key=self.group_lane_at(y); ident=self.lane_at(y)
+            flag='hidden' if self.HEADER-48<=x<self.HEADER-28 else 'locked' if self.HEADER-28<=x<self.HEADER-5 else None
+            if key and flag:
+                self.toggle_lane(key,flag); return
+            if ident is not None:
+                track=self.track_info(ident)
+                if flag: self.change_flag(track,'muted' if flag=='hidden' else 'locked',not track.get('muted' if flag=='hidden' else 'locked',False))
+                else: self.clear_selection(); self.trackSelected.emit(ident)
+                return
+            self.clear_selection()
+            if key=='video': self.videoSelected.emit()
+            elif key=='game': self.gameSelected.emit()
+            elif key=='music': self.musicSelected.emit()
+            return
         effect=self.effect_at(event.position())
-        if effect:
-            self.select_effect(effect)
-            if not effect.get('locked',False):
-                rect=self.effect_rect(effect)
+        video=self.video_at(event.position()) if not effect else None
+        audio=None
+        if not effect and not video:
+            hit_kind,hit_clip,_=self.event_under_pointer(event.position())
+            if hit_kind=='audio': audio=hit_clip
+        kind,clip=('effect',effect) if effect else ('video',video) if video else ('audio',audio)
+        if clip:
+            ctrl=bool(event.modifiers()&Qt.ControlModifier)
+            self.select_item(kind,clip['id'],ctrl=ctrl,preserve=not ctrl)
+            if (kind,clip['id']) not in self.selection: return
+            if not self.item_locked(kind,clip):
+                rect=self.effect_rect(clip) if kind=='effect' else self.video_rect(clip) if kind=='video' else QRectF(self.x(clip['time']),self.clip_row(self.clips.index(clip))+2,max(3,clip['duration']*self.scale()),self.ROW-10)
                 edge='left' if abs(x-rect.left())<8 else 'right' if abs(x-rect.right())<8 else 'move'
-                self.remember(); self.drag_scale=self.scale()
+                self.drag_snapshot=self.snapshot(); self.drag_remembered=False; self.drag_scale=self.scale(); self.drag_width=self.width()
+                # Moving an effect never shifts video or audio, including a mixed
+                # selection. A deliberate group drag stays within its media type.
+                self.drag_group=[(selected_kind,copy.deepcopy(item),self.video_span(item) if selected_kind=='video' else self.effect_span(item) if selected_kind=='effect' else (item['time'],item['duration'])) for selected_kind,item in self.editable_selection() if selected_kind==kind]
                 cfg_info=copy.deepcopy(self.video_cfg)
-                if cfg_info and getattr(cfg_info[0],'effect_clips',None) is not None:
-                    cfg_info[0].effect_clips=[c for c in cfg_info[0].effect_clips if c.get('id')!=effect['id']]
-                self.drag=('effect',effect['id'],edge,self.time(x),copy.deepcopy(effect),self.effect_span(effect),cfg_info)
+                if kind=='effect':
+                    if cfg_info and getattr(cfg_info[0],'effect_clips',None) is not None:
+                        cfg_info[0].effect_clips=[c for c in cfg_info[0].effect_clips if c.get('id')!=clip['id']]
+                    self.drag=('effect',clip['id'],edge,self.time(x),copy.deepcopy(clip),self.effect_span(clip),cfg_info)
+                elif kind=='video': self.drag=('video',clip['id'],edge,self.time(x),copy.deepcopy(clip),self.video_span(clip))
+                else: self.drag=(clip['id'],edge,self.time(x),copy.deepcopy(clip))
+                self.drag_overlay=(kind,clip['id'],edge)
+                self.setCursor(Qt.SizeHorCursor if edge!='move' else Qt.ClosedHandCursor)
             else: self.seek.emit(min(self.duration,self.time(x)))
             self.update(); return
-        if self.HEADER-45<x<self.HEADER-26:
-            if self.game_y()<=y<self.game_y()+self.ROW:
-                self.gameMute.emit(self.game_audio); return
-            if self.music and self.music_y()<=y<self.music_y()+self.ROW:
-                self.musicMute.emit(not self.music.get('muted',False)); return
-        ident=self.lane_at(y)
-        if x<self.HEADER and ident is not None:
-            self.selected_effect_id=None
-            self.trackSelected.emit(ident); track=self.track_info(ident)
-            if track and self.HEADER-45<x<self.HEADER-26:
-                self.remember(); track['muted']=not track.get('muted',False); self.changed.emit()
-            elif track and x>=self.HEADER-26:
-                self.remember(); track['locked']=not track.get('locked',False); self.changed.emit()
-            self.update(); return
-        for i in range(len(self.clips)-1,-1,-1):
-            clip=self.clips[i]
-            cy=self.clip_row(i)
-            if cy<=y<cy+self.ROW and self.x(clip['time'])-5<=x<=self.x(clip['time']+clip['duration'])+5:
-                self.selected_effect_id=None; self.selected_id=clip['id']; self.selected.emit(clip['id'])
-                if x<self.HEADER:
-                    if self.HEADER-45<x<self.HEADER-26:
-                        self.remember(); clip['muted']=not clip.get('muted',False); self.changed.emit()
-                    elif x>=self.HEADER-26:
-                        self.remember(); clip['locked']=not clip.get('locked',False); self.changed.emit()
-                elif not self.locked(clip):
-                    edge='left' if abs(x-self.x(clip['time']))<8 else 'right' if abs(x-self.x(clip['time']+clip['duration']))<8 else 'move'
-                    self.remember(); self.drag_scale=self.scale(); self.drag=(clip['id'],edge,self.time(x),copy.deepcopy(clip))
-                else: self.seek.emit(min(self.duration,self.time(x)))
-                self.update(); return
+        if not event.modifiers()&Qt.ControlModifier: self.clear_selection()
         if self.video_y()<=y<self.video_y()+self.ROW:
-            self.selected_id=None; self.selected_effect_id=None; self.videoSelected.emit()
+            self.videoSelected.emit()
         if x>=self.HEADER:
             self.drag_scale=self.scale(); self.drag=('playhead',); self.seek.emit(min(self.duration,self.time(x)))
 
     def mouseMoveEvent(self,event):
-        if not self.drag: return
+        if not self.drag: self.hover_cursor(event.position()); return
         t=self.time(event.position().x())
         if self.drag[0]=='playhead': self.seek.emit(min(self.duration,t)); return
         if self.drag[0]=='effect':
             self.drag_effect(t); return
+        if self.drag[0]=='video':
+            self.drag_video(t); return
         ident,edge,begin,old=self.drag
         clip=next((c for c in self.clips if c['id']==ident),None)
         if clip is None: return
         delta=t-begin
-        if edge=='move': clip['time']=max(0,old['time']+delta)
+        if abs(delta)<.0001: return
+        self.remember_drag()
+        if edge=='move': self.move_group(delta)
         elif edge=='left':
-            delta=max(-old['source_in'],-old['time'],min(delta,old['duration']-.05))
-            clip['time']=old['time']+delta; clip['source_in']=old['source_in']+delta; clip['duration']=old['duration']-delta
+            rate=max(.01,old.get('rate',1))
+            delta=max(-old['source_in']/rate,-old['time'],min(delta,old['duration']-.05))
+            clip['time']=old['time']+delta; clip['source_in']=old['source_in']+delta*rate; clip['duration']=old['duration']-delta
         else:
-            clip['duration']=max(.05,min(old['duration']+delta,(old.get('source_duration') or old['source_in']+old['duration'])-old['source_in']))
+            rate=max(.01,old.get('rate',1))
+            clip['duration']=max(.05,min(old['duration']+delta,((old.get('source_duration') or old['source_in']+old['duration']*rate)-old['source_in'])/rate))
         self.changed.emit(); self.update()
 
     def mouseReleaseEvent(self,event):
-        self.drag=None; self.resize_content()
+        self.drag=None; self.drag_overlay=None; self.drag_group=[]; self.drag_snapshot=None; self.drag_remembered=False; self.resize_content(); self.hover_cursor(event.position())
 
-    def select_effect(self,clip):
-        self.selected_id=None; self.selected_effect_id=clip['id']; self.effectSelected.emit(clip['id']); self.update()
+    def remember_drag(self):
+        if getattr(self,'drag_remembered',False): return
+        self.history.append(copy.deepcopy(getattr(self,'drag_snapshot',None) or self.snapshot())); self.history=self.history[-100:]; self.future=[]; self.drag_remembered=True
+
+    def select_effect(self,clip): self.select_item('effect',clip['id'])
 
     def source_for_output(self,t,cfg_info=None):
         cfg_info=cfg_info or self.video_cfg
         if cfg_info:
             from engine.live import sample_output
             cfg,info=cfg_info
-            end=cfg.trim_end if cfg.trim_end is not None else info['duration']
-            return min(end-1/max(1,cfg.output_fps),max(cfg.trim_start,sample_output(cfg,info,max(0,t))[0]))
+            end=info['duration'] if self.fixed_video_mode() else cfg.trim_end if cfg.trim_end is not None else info['duration']
+            start=0 if self.fixed_video_mode() else cfg.trim_start
+            return min(end-1/max(1,cfg.output_fps),max(start,sample_output(cfg,info,max(0,t))[0]))
         return max(0,t)
 
     def slowmo_position(self,clip,source,duration,cfg_info=None):
@@ -438,8 +558,30 @@ class TrackCanvas(QWidget):
     def drag_effect(self,t):
         _,ident,edge,begin,old,span,cfg_info=self.drag
         clip=next((c for c in self.effects if c.get('id')==ident),None)
-        if clip is None or clip.get('locked'): return
+        if clip is None or self.item_locked('effect',clip): return
         start,duration=span; delta=t-begin; kind=old.get('kind')
+        if abs(delta)<.0001: return
+        self.remember_drag()
+        if self.fixed_video_mode():
+            if edge=='move': self.move_group(delta)
+            elif edge=='left':
+                if kind!='slowmo':
+                    clip['animation_time']=old.get('animation_time',start); clip['animation_duration']=old.get('animation_duration',duration)
+                delta=max(-start,min(delta,duration-.05))
+                if kind=='freeze': delta=max(duration-60,delta)
+                if kind=='slowmo':
+                    speed=max(.1,old.get('speed',old.get('params',{}).get('speed',.5)))
+                    source=old.get('source_time',0); high=self.video_cfg[1]['duration']-.001 if self.video_cfg else float('inf')
+                    delta=max(-source/speed,min(delta,(high-source)/speed))
+                    clip['source_time']=source+delta*speed
+                clip['time']=start+delta; clip['duration']=duration-delta
+                if kind=='slowmo': clip['source_duration']=clip['duration']*speed
+            else:
+                if kind!='slowmo':
+                    clip['animation_time']=old.get('animation_time',start); clip['animation_duration']=old.get('animation_duration',duration)
+                clip['duration']=max(.05,min(60 if kind=='freeze' else float('inf'),duration+delta))
+                if kind=='slowmo': clip['source_duration']=clip['duration']*old.get('speed',old.get('params',{}).get('speed',.5))
+            self.changed.emit(); self.update(); return
         if kind in ('freeze','slowmo'):
             if edge=='move':
                 clip['source_time']=self.source_for_output(max(0,start+delta),cfg_info)
@@ -475,70 +617,80 @@ class TrackCanvas(QWidget):
         self.changed.emit(); self.update()
 
     def split(self):
-        clip=next((c for c in self.clips if c['id']==self.selected_id),None)
-        if not clip or self.locked(clip): return False
-        left=self.position-clip['time']
-        if not .05<left<clip['duration']-.05: return False
-        self.remember(); right=copy.deepcopy(clip); right['id']=uuid.uuid4().hex
-        right['time']=self.position; right['source_in']+=left; right['duration']-=left
-        right['fade_in']=0; clip['fade_out']=0
-        clip['duration']=left; self.clips.insert(self.clips.index(clip)+1,right)
-        self.selected_id=right['id']; self.selected.emit(right['id']); self.changed.emit(); self.resize_content(); return True
+        return self.split_selected()
 
     def keyPressEvent(self,event):
         if not self.enabled_edit: return super().keyPressEvent(event)
         if event.key()==Qt.Key_Z and event.modifiers()&Qt.ControlModifier:
             self.redo() if event.modifiers()&Qt.ShiftModifier else self.undo()
         elif event.key()==Qt.Key_Y and event.modifiers()&Qt.ControlModifier: self.redo()
-        elif event.key()==Qt.Key_S and event.modifiers()&Qt.ControlModifier: self.split()
+        elif event.key()==Qt.Key_A and event.modifiers()==Qt.ControlModifier: self.select_all()
         elif event.key() in (Qt.Key_Delete,Qt.Key_Backspace): self.remove_selected()
         else: super().keyPressEvent(event)
 
     def remove_selected(self):
-        effect=next((c for c in self.effects if c.get('id')==self.selected_effect_id),None)
-        if effect and not effect.get('locked'): self.remove_effect(effect); return True
-        clip=next((c for c in self.clips if c.get('id')==self.selected_id),None)
-        if clip and not self.locked(clip): self.remove_clip(clip); return True
-        return False
+        return TimelineOperations.remove_selected(self)
 
     def make_menu(self,pos):
         if not self.enabled_edit: return
         t=min(self.duration,self.time(pos.x())); ident=self.lane_at(pos.y())
         effect=self.effect_at(QPointF(pos))
+        video=self.video_at(QPointF(pos))
         clip=next((c for i,c in reversed(list(enumerate(self.clips))) if self.clip_row(i)<=pos.y()<self.clip_row(i)+self.ROW and self.x(c['time'])<=pos.x()<=self.x(c['time']+c['duration'])),None)
         menu=QMenu(self)
         if effect:
-            self.select_effect(effect)
+            self.select_item('effect',effect['id'],preserve=True)
             menu.addSection(effect.get('name') or EFFECT_NAMES.get(effect.get('kind'),'تأثير'))
             menu.addAction('خصائص التأثير',lambda:self.effectSelected.emit(effect['id']))
-            duplicate=menu.addAction('نسخ التأثير',lambda:self.duplicate_effect(effect)); duplicate.setEnabled(not effect.get('locked',False))
-            active=menu.addAction('تفعيل التأثير'); active.setCheckable(True); active.setChecked(not effect.get('muted',False)); active.setEnabled(not effect.get('locked',False)); active.triggered.connect(lambda checked:self.change_flag(effect,'muted',not checked))
+            split=menu.addAction(icon('cut'),'تقسيم المحدد هنا',lambda:self.split_at(t)); split.setEnabled(self.can_split_at(t))
+            duplicate=menu.addAction(icon('duplicate'),'نسخ المحدد',self.duplicate_selected); duplicate.setEnabled(bool(self.editable_selection()))
+            active=menu.addAction('تفعيل التأثير'); active.setCheckable(True); active.setChecked(not effect.get('muted',False)); active.setEnabled(not self.item_locked('effect',effect)); active.triggered.connect(lambda checked:self.change_flag(effect,'muted',not checked))
             lock=menu.addAction('قفل التأثير'); lock.setCheckable(True); lock.setChecked(effect.get('locked',False)); lock.triggered.connect(lambda checked:self.change_flag(effect,'locked',checked))
-            remove=menu.addAction('حذف التأثير',lambda:self.remove_effect(effect)); remove.setEnabled(not effect.get('locked',False))
+            lock.setEnabled(not self.lane_state(self.lane_key('effect',effect)).get('locked',False))
+            remove=menu.addAction(icon('delete'),'حذف المحدد',self.remove_selected); remove.setEnabled(bool(self.editable_selection()))
             menu.addSeparator()
+        elif video:
+            self.select_item('video',video['id'],preserve=True)
+            menu.addSection(video.get('name') or 'الفيديو')
+            menu.addAction('خصائص مقطع الفيديو',lambda:self.selectedVideo.emit(video['id']))
+            split=menu.addAction(icon('cut'),'تقسيم المحدد هنا',lambda:self.split_at(t)); split.setEnabled(self.can_split_at(t))
+            start,duration=self.video_span(video); interior=not self.item_locked('video',video) and start+.05<t<start+duration-.05
+            left=menu.addAction('قص البداية إلى هنا',lambda:self.trim_video(video,t,True)); left.setEnabled(interior)
+            right=menu.addAction('قص النهاية هنا',lambda:self.trim_video(video,t,False)); right.setEnabled(interior)
+            duplicate=menu.addAction(icon('duplicate'),'نسخ المحدد',self.duplicate_selected); duplicate.setEnabled(bool(self.editable_selection()))
+            hidden=menu.addAction('إخفاء المقطع'); hidden.setCheckable(True); hidden.setChecked(video.get('muted',False)); hidden.setEnabled(not self.item_locked('video',video)); hidden.triggered.connect(lambda checked:self.change_flag(video,'muted',checked))
+            lock=menu.addAction('قفل المقطع'); lock.setCheckable(True); lock.setChecked(video.get('locked',False)); lock.triggered.connect(lambda checked:self.change_flag(video,'locked',checked))
+            lock.setEnabled(not self.lane_state('video').get('locked',False))
+            remove=menu.addAction(icon('delete'),'حذف المحدد',self.remove_selected); remove.setEnabled(bool(self.editable_selection()))
+            menu.addAction('تجميد عند هذه اللقطة',lambda:self.addEffect.emit('freeze',t)); menu.addSeparator()
         elif clip:
-            self.selected_effect_id=None; self.selected_id=clip['id']; self.selected.emit(clip['id']); self.update()
+            self.select_item('audio',clip['id'],preserve=True)
             menu.addSection(clip.get('display_name') or clip.get('name') or os.path.basename(clip['path']))
             menu.addAction('خصائص المقطع',lambda:self.selected.emit(clip['id']))
-            split=menu.addAction('تقسيم هنا',lambda:self.split_at(t)); split.setEnabled(not self.locked(clip) and clip['time']+.05<t<clip['time']+clip['duration']-.05)
-            left=menu.addAction('قص البداية إلى هنا',lambda:self.trim_clip(clip,t,True)); left.setEnabled(split.isEnabled())
-            right=menu.addAction('قص النهاية هنا',lambda:self.trim_clip(clip,t,False)); right.setEnabled(split.isEnabled())
-            duplicate=menu.addAction('نسخ المقطع',lambda:self.duplicate(clip)); duplicate.setEnabled(not self.locked(clip))
-            mute=menu.addAction('كتم المقطع'); mute.setCheckable(True); mute.setChecked(clip.get('muted',False)); mute.triggered.connect(lambda checked:self.change_flag(clip,'muted',checked))
+            split=menu.addAction(icon('cut'),'تقسيم المحدد هنا',lambda:self.split_at(t)); split.setEnabled(self.can_split_at(t))
+            interior=not self.locked(clip) and clip['time']+.05<t<clip['time']+clip['duration']-.05
+            left=menu.addAction('قص البداية إلى هنا',lambda:self.trim_clip(clip,t,True)); left.setEnabled(interior)
+            right=menu.addAction('قص النهاية هنا',lambda:self.trim_clip(clip,t,False)); right.setEnabled(interior)
+            duplicate=menu.addAction(icon('duplicate'),'نسخ المحدد',self.duplicate_selected); duplicate.setEnabled(bool(self.editable_selection()))
+            mute=menu.addAction('كتم المقطع'); mute.setCheckable(True); mute.setChecked(clip.get('muted',False)); mute.setEnabled(not self.locked(clip)); mute.triggered.connect(lambda checked:self.change_flag(clip,'muted',checked))
             lock=menu.addAction('قفل المقطع'); lock.setCheckable(True); lock.setChecked(clip.get('locked',False)); lock.triggered.connect(lambda checked:self.change_flag(clip,'locked',checked))
-            remove=menu.addAction('حذف المقطع',lambda:self.remove_clip(clip)); remove.setEnabled(not self.locked(clip))
+            lock.setEnabled(not self.track_info(clip.get('track')).get('locked',False))
+            remove=menu.addAction(icon('delete'),'حذف المحدد',self.remove_selected); remove.setEnabled(bool(self.editable_selection()))
             menu.addSeparator()
-        elif self.video_y()<=pos.y()<self.video_y()+self.ROW and self.video_cfg:
+        elif self.video_y()<=pos.y()<self.video_y()+self.ROW and self.video_cfg and not self.fixed_video_mode():
             from engine.live import sample_output
             source=sample_output(*self.video_cfg,t)[0]
             menu.addAction('خصائص الفيديو',self.videoSelected.emit)
             menu.addAction('القص يبدأ من هنا',lambda:self.trimStart.emit(source))
             menu.addAction('القص ينتهي هنا',lambda:self.trimEnd.emit(source))
             menu.addAction('تجميد عند هذه اللقطة',lambda:self.addEffect.emit('freeze',t)); menu.addSeparator()
-        elif self.game_y()<=pos.y()<self.game_y()+self.ROW:
+        elif self.video_y()<=pos.y()<self.video_y()+self.ROW and self.fixed_video_mode():
+            menu.addAction('خصائص الفيديو',self.videoSelected.emit)
+            menu.addAction('تجميد عند هذه اللقطة',lambda:self.addEffect.emit('freeze',t)); menu.addSeparator()
+        elif not self.fixed_video_mode() and self.game_y()<=pos.y()<self.game_y()+self.ROW:
             menu.addAction('إعدادات صوت الفيديو',self.gameSelected.emit)
             mute=menu.addAction('كتم صوت الفيديو'); mute.setCheckable(True); mute.setChecked(not self.game_audio); mute.triggered.connect(self.gameMute.emit); menu.addSeparator()
-        elif self.music and self.music_y()<=pos.y()<self.music_y()+self.ROW:
+        elif not self.fixed_video_mode() and self.music and self.music_y()<=pos.y()<self.music_y()+self.ROW:
             menu.addAction('إعدادات الموسيقى',self.musicSelected.emit)
             mute=menu.addAction('كتم الموسيقى'); mute.setCheckable(True); mute.setChecked(self.music.get('muted',False)); mute.triggered.connect(self.musicMute.emit); menu.addSeparator()
         if ident is not None:
@@ -549,12 +701,18 @@ class TrackCanvas(QWidget):
                 lock=menu.addAction('قفل المسار'); lock.setCheckable(True); lock.setChecked(track.get('locked',False)); lock.triggered.connect(lambda checked:self.change_flag(track,'locked',checked))
                 remove=menu.addAction('حذف المسار',lambda:self.remove_track(ident)); remove.setEnabled(not track.get('locked'))
             menu.addSeparator()
+        lane=self.group_lane_at(pos.y())
+        if lane:
+            hidden=menu.addAction(icon('eye-off'),'إخفاء المسار'); hidden.setCheckable(True); hidden.setChecked(self.lane_state(lane).get('hidden',False)); hidden.triggered.connect(lambda checked:self.set_lane_flag(lane,'hidden',checked))
+            lock=menu.addAction(icon('lock'),'قفل المسار'); lock.setCheckable(True); lock.setChecked(self.lane_state(lane).get('locked',False)); lock.triggered.connect(lambda checked:self.set_lane_flag(lane,'locked',checked))
+            menu.addSeparator()
         add=menu.addAction('إضافة صوت هنا…',lambda:self.addAudio.emit(t,ident)); add.setEnabled(not self.track_info(ident).get('locked',False))
         menu.addAction('إضافة مسار صوت فارغ',self.addTrack.emit)
         menu.addSeparator()
         effects_menu=menu.addMenu('إضافة تأثير هنا')
         for kind,name in EFFECT_NAMES.items():
             effects_menu.addAction(name,lambda checked=False,kind=kind:self.addEffect.emit(kind,t))
+        menu.addSeparator(); menu.addAction('تحديد جميع المقاطع',self.select_all)
         return menu
 
     def context(self,pos):
@@ -565,13 +723,13 @@ class TrackCanvas(QWidget):
     def trim_clip(self,clip,t,left):
         if self.locked(clip): return
         self.remember(); delta=t-clip['time']
-        if left: clip['source_in']+=delta; clip['duration']-=delta; clip['time']=t
+        if left: clip['source_in']+=delta*clip.get('rate',1); clip['duration']-=delta; clip['time']=t
         else: clip['duration']=delta
         self.changed.emit(); self.resize_content()
     def duplicate(self,clip):
         self.remember(); new=copy.deepcopy(clip); new['id']=uuid.uuid4().hex; new['time']+=new['duration']; self.clips.append(new); self.changed.emit(); self.resize_content()
     def change_flag(self,item,key,value):
-        if key=='muted' and not value and item.get('kind')=='slowmo':
+        if not self.fixed_video_mode() and key=='muted' and not value and item.get('kind')=='slowmo':
             candidate=copy.deepcopy(item); candidate['muted']=False
             available=self.slowmo_position(candidate,item['source_time'],item['source_duration'])
             if available is None or abs(available-item['source_time'])>1e-6:
@@ -582,9 +740,12 @@ class TrackCanvas(QWidget):
         if self.locked(clip): return
         self.remember(); self.clips.remove(clip)
         if self.selected_id==clip['id']: self.selected_id=None
+        self.selection.discard(('audio',clip['id'])); self.sync_selection()
         self.changed.emit(); self.resize_content()
     def duplicate_effect(self,clip):
-        if clip.get('locked'): return
+        if self.item_locked('effect',clip): return
+        if self.fixed_video_mode():
+            self.select_item('effect',clip['id']); return self.duplicate_selected()
         self.remember(); new=copy.deepcopy(clip); new['id']=uuid.uuid4().hex
         start,duration=self.effect_span(clip)
         if clip.get('kind') in ('freeze','slowmo'):
@@ -598,13 +759,15 @@ class TrackCanvas(QWidget):
         else: new['time']=start+duration
         self.effects.append(new); self.select_effect(new); self.changed.emit(); self.resize_content()
     def remove_effect(self,clip):
-        if clip.get('locked'): return
+        if self.item_locked('effect',clip): return
         self.remember(); self.effects.remove(clip)
         if self.selected_effect_id==clip['id']: self.selected_effect_id=None; self.effectSelected.emit('')
+        self.selection.discard(('effect',clip['id'])); self.sync_selection()
         self.changed.emit(); self.resize_content()
     def remove_track(self,ident):
         if self.track_info(ident).get('locked'): return
         self.remember(); self.clips[:]=[c for c in self.clips if c.get('track')!=ident]; self.tracks[:]=[t for t in self.tracks if t['id']!=ident]; self.changed.emit(); self.resize_content()
+        self.sync_selection()
     def dragEnterEvent(self,event):
         if event.mimeData().hasUrls(): event.acceptProposedAction()
     def dragMoveEvent(self,event):

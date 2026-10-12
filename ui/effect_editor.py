@@ -15,6 +15,15 @@ def spin(value=0,minimum=0,maximum=86400,suffix=' ث'):
     w=QDoubleSpinBox(); w.setRange(minimum,maximum); w.setDecimals(3); w.setSingleStep(.1); w.setSuffix(suffix); w.setValue(value); return w
 
 class EffectEditor:
+    def fixed_effect_mode(self):
+        return getattr(self.audio_timeline.canvas,'video_clips',None) is not None
+
+    def effect_lane(self,kind):
+        return 'motion' if kind in ('freeze','slowmo') else 'background' if kind=='background' else 'visual'
+
+    def effect_lane_locked(self,kind):
+        return self.audio_timeline.canvas.lane_states.get(self.effect_lane(kind),{}).get('locked',False)
+
     def make_effect_tab(self):
         box=self.tab('التأثير'); self.effect_tab_index=self.sidebar.count()-1
         self.effect_combo=QComboBox(); self.effect_combo.currentIndexChanged.connect(self.effect_combo_changed); box.addWidget(self.effect_combo)
@@ -64,7 +73,10 @@ class EffectEditor:
         if index>=0: self.select_effect(self.effect_combo.itemData(index))
 
     def select_effect(self,ident):
-        self.audio_timeline.canvas.selected_effect_id=ident; self.audio_timeline.canvas.selected_id=None
+        canvas=self.audio_timeline.canvas
+        if ident and ('effect',ident) not in canvas.selection:
+            canvas.select_item('effect',ident); return
+        canvas.selected_effect_id=ident
         clip=self.selected_effect()
         if not clip: return
         self.refresh_effect_combo(); self.refresh_effect_fields(); self.refresh_audio_fields()
@@ -84,26 +96,40 @@ class EffectEditor:
             if clip:
                 p=clip.get('params',{}); start,length=effect_span(self.config(),self.info,clip)
                 self.effect_name.setText(clip.get('name',EFFECT_NAMES[kind])); self.effect_time.setValue(start)
-                self.effect_length.setMaximum(60 if kind=='freeze' else 86400); self.effect_length.setValue(length); self.effect_length.setReadOnly(kind=='slowmo')
-                self.effect_source.setRange(self.trim_in.value(),max(self.trim_in.value(),self.trim_out.value()-.001)); self.effect_source.setValue(clip.get('source_time',self.source_position))
-                self.effect_source_length.setMaximum(max(.02,self.trim_out.value()-clip.get('source_time',self.source_position))); self.effect_source_length.setValue(clip.get('source_duration',.5))
+                self.effect_length.setMaximum(60 if kind=='freeze' else 86400); self.effect_length.setValue(length); self.effect_length.setReadOnly(kind=='slowmo' and not self.fixed_effect_mode())
+                source_low,source_high=(0,self.info['duration']) if self.fixed_effect_mode() else (self.trim_in.value(),self.trim_out.value())
+                self.effect_source.setRange(source_low,max(source_low,source_high-.001)); self.effect_source.setValue(clip.get('source_time',self.source_position))
+                self.effect_source_length.setMaximum(max(.02,source_high-clip.get('source_time',self.source_position))); self.effect_source_length.setValue(clip.get('source_duration',length*clip.get('speed',.45)))
                 self.effect_enabled.setChecked(not clip.get('muted',False)); self.effect_locked.setChecked(clip.get('locked',False))
                 self.effect_style.setCurrentIndex(self.effect_style.findData(p.get('motion_style','hold'))); self.effect_angle.setValue(p.get('orbit_angle',360)); self.effect_direction.setCurrentIndex(self.effect_direction.findData(p.get('rotation_direction',1)))
                 self.effect_speed.setValue(clip.get('speed',.45)); self.effect_strength.setValue(round(p.get('strength',p.get('motion_strength',.65))*100))
                 self.effect_contrast.setValue(p.get('contrast',1.05)); self.effect_saturation.setValue(p.get('saturation',1.08)); self.effect_sharpness.setValue(p.get('sharpness',.35))
                 if clip.get('locked'):
                     for w in controls:
-                        if w not in (self.effect_enabled,self.effect_locked): w.setEnabled(False)
+                        if w is not self.effect_locked: w.setEnabled(False)
+                if self.effect_lane_locked(kind):
+                    for w in controls: w.setEnabled(False)
         finally: self.syncing_effect=False
 
     def effect_fields_changed(self,*args):
         if self.syncing_effect or self.loading_project or self.busy: return
         clip=self.selected_effect()
         if not clip: return
-        sender=self.sender(); old=copy.deepcopy(clip); self.audio_timeline.canvas.remember()
+        if self.effect_lane_locked(clip['kind']):
+            self.refresh_effect_fields(); self.status.setText('المسار مقفل؛ أزل قفله من رأس المسار أولًا.'); return
+        sender=self.sender()
+        if clip.get('locked') and sender is not self.effect_locked:
+            self.refresh_effect_fields(); self.status.setText('التأثير مقفل؛ أزل قفله أولًا.'); return
+        old=copy.deepcopy(clip); self.audio_timeline.canvas.remember()
         clip.update(name=self.effect_name.text() or EFFECT_NAMES[clip['kind']],muted=not self.effect_enabled.isChecked(),locked=self.effect_locked.isChecked())
         p=clip.setdefault('params',{}); p['strength']=self.effect_strength.value()/100
-        if clip['kind'] in ('freeze','slowmo'):
+        fixed=self.fixed_effect_mode()
+        if fixed:
+            if sender is self.effect_time or 'time' not in clip: clip['time']=self.effect_time.value()
+            if clip['kind'] in ('freeze','slowmo'):
+                if sender is self.effect_source or 'source_time' not in clip:
+                    clip['source_time']=max(0,min(self.effect_source.value(),self.info['duration']-.001))
+        elif clip['kind'] in ('freeze','slowmo'):
             if sender is self.effect_time:
                 cfg=self.config(); cfg.effect_clips=[c for c in cfg.effect_clips if c['id']!=clip['id']]
                 source=sample_output(cfg,self.info,self.effect_time.value())[0]
@@ -111,33 +137,52 @@ class EffectEditor:
             clip['source_time']=max(self.trim_in.value(),min(source,self.trim_out.value()-.001))
         else: clip['time']=self.effect_time.value()
         if clip['kind']=='freeze':
-            clip['duration']=self.effect_length.value(); p.update(motion_style=self.effect_style.currentData(),orbit_angle=self.effect_angle.value(),rotation_direction=self.effect_direction.currentData(),motion_strength=self.effect_strength.value()/100)
+            if not fixed or sender is self.effect_length or 'duration' not in clip: clip['duration']=self.effect_length.value()
+            p.update(motion_style=self.effect_style.currentData(),orbit_angle=self.effect_angle.value(),rotation_direction=self.effect_direction.currentData(),motion_strength=self.effect_strength.value()/100)
         elif clip['kind']=='slowmo':
-            clip['speed']=self.effect_speed.value(); clip['source_duration']=min(self.effect_source_length.value(),self.trim_out.value()-clip['source_time'])
-            if not clip.get('muted'):
+            if not fixed or sender is self.effect_speed or 'speed' not in clip: clip['speed']=self.effect_speed.value()
+            if fixed:
+                if sender is self.effect_source_length:
+                    clip['source_duration']=self.effect_source_length.value(); clip['duration']=max(.05,clip['source_duration']/clip['speed'])
+                elif sender in (self.effect_length,self.effect_speed) or 'duration' not in clip:
+                    if sender is self.effect_length or 'duration' not in clip: clip['duration']=self.effect_length.value()
+                    clip['source_duration']=clip['duration']*clip['speed']
+            else: clip['source_duration']=min(self.effect_source_length.value(),self.trim_out.value()-clip['source_time'])
+            if not fixed and not clip.get('muted'):
                 desired=clip['source_time']; available=self.audio_timeline.canvas.slowmo_position(clip,desired,clip['source_duration'])
                 if available is None or abs(available-desired)>1e-6:
                     clip.clear(); clip.update(old); self.refresh_effect_fields(); self.status.setText('الجزء المحدد يتداخل مع تباطؤ آخر؛ اختَر جزءًا مختلفًا.'); return
-        else: clip['duration']=self.effect_length.value()
+        elif not fixed or sender is self.effect_length or 'duration' not in clip: clip['duration']=self.effect_length.value()
         if clip['kind']=='clarity': p.update(contrast=self.effect_contrast.value(),saturation=self.effect_saturation.value(),sharpness=self.effect_sharpness.value())
+        if fixed:
+            if sender is self.effect_time and 'animation_time' in clip:
+                clip['animation_time']+=clip['time']-old.get('time',0)
+            if sender in (self.effect_length,self.effect_source_length):
+                clip.pop('animation_time',None); clip.pop('animation_duration',None)
         mapping=('muted','source_time','duration') if clip['kind']=='freeze' else ('muted','source_time','source_duration','speed') if clip['kind']=='slowmo' else ()
-        if any(clip.get(k)!=old.get(k) for k in mapping):
+        if not fixed and any(clip.get(k)!=old.get(k) for k in mapping):
             self.pause_live()
             if self.live_audio: self.live_audio.discontinuity()
         self.refresh_effect_fields(); self.refresh_effect_combo(); self.invalidate()
 
     def add_effect(self,kind,t=None,params=None,source=None):
         if self.busy or not self.info: return
+        if self.effect_lane_locked(kind):
+            self.status.setText('المسار مقفل؛ أزل قفله قبل إضافة تأثير.'); return
         self.pause_live(); t=self.output_position if t is None else t
         plan=edit_plan(self.config(),self.info); t=max(0,min(t,max(0,plan['duration']-.05)))
         clip=dict(id=uuid.uuid4().hex,kind=kind,name=EFFECT_NAMES[kind],muted=False,locked=False,params=copy.deepcopy(params or {}))
+        fixed=self.fixed_effect_mode()
+        if fixed: clip['time']=t
         if kind in ('freeze','slowmo'):
             source=sample_output(self.config(),self.info,t)[0] if source is None else source
-            clip['source_time']=min(max(self.trim_in.value(),source),self.trim_out.value()-.001)
+            source_low,source_high=(0,self.info['duration']) if fixed else (self.trim_in.value(),self.trim_out.value())
+            clip['source_time']=min(max(source_low,source),source_high-.001)
             if kind=='freeze': clip['duration']=3; clip['params'].setdefault('motion_style','hold'); clip['params'].setdefault('motion_strength',.65)
             else:
-                clip['source_duration']=min(.5,self.trim_out.value()-clip['source_time']); clip['speed']=.45
-                for other in self.effect_clips:
+                clip['source_duration']=min(.5,source_high-clip['source_time']); clip['speed']=.45
+                if fixed: clip['duration']=max(.05,clip['source_duration']/clip['speed'])
+                for other in self.effect_clips if not fixed else ():
                     if other['kind']=='slowmo' and not other.get('muted') and other['source_time']<clip['source_time']+clip['source_duration'] and clip['source_time']<other['source_time']+other['source_duration']:
                         self.status.setText('هذا الجزء فيه تباطؤ بالفعل؛ حدّد مقطعه لتعديل السرعة.'); return
         else: clip.update(time=t,duration=max(.05,min(3,plan['duration']-t)))
@@ -146,11 +191,11 @@ class EffectEditor:
 
     def remove_selected_effect(self):
         clip=self.selected_effect()
-        if clip and not clip.get('locked'): self.audio_timeline.canvas.remove_effect(clip)
+        if clip and not self.audio_timeline.canvas.item_locked('effect',clip): self.audio_timeline.canvas.remove_effect(clip)
 
     def duplicate_selected_effect(self):
         clip=self.selected_effect()
-        if clip and not clip.get('locked'): self.audio_timeline.canvas.duplicate_effect(clip)
+        if clip and not self.audio_timeline.canvas.item_locked('effect',clip): self.audio_timeline.canvas.duplicate_effect(clip)
 
     def add_builtin_sound(self,key):
         if self.busy or not self.info: return
@@ -172,7 +217,7 @@ class EffectEditor:
     def background_fields_changed(self,*args):
         if self.syncing_effect or self.loading_project: return
         clip=self.selected_effect()
-        if clip and clip['kind']=='background' and not clip.get('locked'):
+        if clip and clip['kind']=='background' and not self.audio_timeline.canvas.item_locked('effect',clip):
             self.audio_timeline.canvas.remember(); clip['params']=self.background_params(); self.invalidate()
 
     def legacy_effects(self,cfg):
@@ -180,8 +225,8 @@ class EffectEditor:
         def add(kind,**data):
             clip=dict(id=uuid.uuid4().hex,kind=kind,name=EFFECT_NAMES[kind],muted=False,locked=False,params={}); clip.update(data); clips.append(clip); return clip
         if cfg.animation:
-            add('freeze',source_time=cfg.freeze_time,duration=cfg.orbit_seconds,params=dict(motion_style=cfg.motion_style,orbit_angle=cfg.orbit_angle,rotation_direction=cfg.rotation_direction,motion_strength=cfg.motion_strength))
-            if cfg.slowmo and old['ramp_src']: add('slowmo',source_time=cfg.trim_start+old['before']/cfg.output_fps,source_duration=old['ramp_src']/cfg.output_fps,speed=old['ramp_src']/old['ramp_out'])
+            add('freeze',time=old['freeze'],source_time=cfg.freeze_time,duration=cfg.orbit_seconds,params=dict(motion_style=cfg.motion_style,orbit_angle=cfg.orbit_angle,rotation_direction=cfg.rotation_direction,motion_strength=cfg.motion_strength))
+            if cfg.slowmo and old['ramp_src']: add('slowmo',time=old['ramp'],duration=old['ramp_out']/cfg.output_fps,source_time=cfg.trim_start+old['before']/cfg.output_fps,source_duration=old['ramp_src']/cfg.output_fps,speed=old['ramp_src']/old['ramp_out'])
         for kind in ('clarity','glow','bars'):
             if getattr(cfg,kind): add(kind,time=0,duration=old['duration'])
         for kind in ('flash','shake','scan'):
