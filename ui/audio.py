@@ -136,7 +136,16 @@ class LiveAudio(QObject):
                 output_frame=max(segment['output_start'],min(segment['output_end'],time*cfg.output_fps))
                 source=cfg.trim_start+(segment['source_start']+(output_frame-segment['output_start'])*game_rate)/cfg.output_fps
         active={'game'}
-        self.sync_voice('game',cfg.video,source,cfg.game_volume,playing,cfg.game_audio and info['audio'] and game_active,game_rate)
+        game_enabled=cfg.game_audio; game_gain=cfg.game_volume
+        if original and cfg.video_clips is not None:
+            tracks={str(track['id']):track for track in cfg.audio_tracks}
+            source_clip=next((clip for clip in cfg.sound_effects if clip.get('source_audio')
+                             and clip['path']==cfg.video and not clip.get('muted')
+                             and not tracks.get(str(clip.get('track')),{}).get('muted')
+                             and clip.get('source_in',0)<=source<clip.get('source_in',0)+clip['duration']*clip.get('rate',1)),None)
+            game_enabled=source_clip is not None
+            if source_clip: game_gain=source_clip['volume']*tracks.get(str(source_clip.get('track')),{}).get('volume',1)
+        self.sync_voice('game',cfg.video,source,game_gain,playing,game_enabled and info['audio'] and game_active,game_rate)
         if original:
             self.pause_missing(active)
             return
