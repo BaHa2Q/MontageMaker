@@ -15,10 +15,10 @@
 [Setup]
 AppId={{#InstallerId}
 AppName={#InstallerName}
-AppVersion=3.0
+AppVersion=4.0
 AppPublisher=Montage Maker Studio
 DefaultDirName={autopf}\Montage Maker Studio
-DefaultGroupName=Montage Maker Studio 3
+DefaultGroupName=Montage Maker Studio 4
 UninstallDisplayIcon={app}\MontageMaker.exe
 SetupIconFile=assets\montage.ico
 OutputDir={#SetupOutput}
@@ -47,8 +47,8 @@ Source: "{#BuildDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs c
 Source: "README.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Montage Maker Studio 3"; Filename: "{app}\MontageMaker.exe"; WorkingDir: "{app}"; IconFilename: "{app}\MontageMaker.exe"
-Name: "{autodesktop}\Montage Maker Studio 3"; Filename: "{app}\MontageMaker.exe"; WorkingDir: "{app}"; IconFilename: "{app}\MontageMaker.exe"; Tasks: desktopicon
+Name: "{group}\Montage Maker Studio 4"; Filename: "{app}\MontageMaker.exe"; WorkingDir: "{app}"; IconFilename: "{app}\MontageMaker.exe"
+Name: "{autodesktop}\Montage Maker Studio 4"; Filename: "{app}\MontageMaker.exe"; WorkingDir: "{app}"; IconFilename: "{app}\MontageMaker.exe"; Tasks: desktopicon
 Name: "{group}\Uninstall Montage Maker Studio"; Filename: "{uninstallexe}"
 
 [Run]

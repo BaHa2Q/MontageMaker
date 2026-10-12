@@ -14,7 +14,11 @@ def verify_distribution(video, report):
                      output_height=360, output_fps=15, quality='draft',
                      builtin_fx=False, game_audio=False, slowmo=False,
                      protected_polygons=[[[.42,.38],[.7,.38],[.7,.8],[.42,.8]]],
-                     protected_time=.3, background_blur=14, background_particles=True)
+                     protected_time=.3, background_blur=14, background_particles=True,
+                     effect_clips=[
+                         dict(id='freeze1',kind='freeze',source_time=.2,duration=.4,params=dict(motion_style='hold')),
+                         dict(id='freeze2',kind='freeze',source_time=.7,duration=.4,params=dict(motion_style='spin',orbit_angle=180)),
+                         dict(id='bg',kind='background',time=0,duration=3,params=dict(background_template='particles',background_blur=14))])
         run_montage(cfg, log=lambda message: None)
         info = media_info(out)
         # Check the bundled GUI and multimedia plugins, not only the rendering libraries.
@@ -35,6 +39,11 @@ def verify_distribution(video, report):
         studio.source_position=.3
         studio.commit_selection()
         assert len(studio.config().protected_polygons)==1
+        studio.add_effect('freeze',source=.3)
+        studio.add_effect('freeze',source=.8)
+        studio.add_builtin_sound('whoosh')
+        studio.add_builtin_sound('impact')
+        assert len(studio.config().effect_clips)==2 and len(studio.config().sound_effects)==2
         deadline=time.monotonic()+10
         while (studio.analysis_jobs or studio.fx_jobs or studio.proxy_jobs) and time.monotonic()<deadline:
             QApplication.processEvents(); time.sleep(.02)
@@ -44,7 +53,8 @@ def verify_distribution(video, report):
             raise RuntimeError('The bundled video player did not decode a frame.')
         data = dict(ok=True, app=APP_DIR, ffmpeg=FFMPEG, ffprobe=FFPROBE,
                     output=info, frames=probe_frames(out), gui_playback=playback,
-                    live_editor=True, selection_auto_commit=True)
+                    live_editor=True, selection_auto_commit=True,
+                    repeated_effects=True,builtin_sound_clips=True)
     except Exception as ex:
         import traceback
         data = dict(ok=False, error=str(ex), traceback=traceback.format_exc())

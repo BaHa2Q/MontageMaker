@@ -55,6 +55,8 @@ class Config:
     fx_volume: float = 0.6
     sound_effects: list = field(default_factory=list)
     audio_tracks: list = field(default_factory=list)
+    # None opens legacy projects; a list contains only the effects placed on the timeline.
+    effect_clips: list | None = None
     output_height: int = 1080
     output_fps: int = 60
     quality: str = 'high'
@@ -110,7 +112,7 @@ def validate(cfg, info):
         raise ValueError('The trim must be inside the original video and the end must follow the start.')
     if end - cfg.trim_start < 0.25:
         raise ValueError('Select at least 0.25 seconds of video.')
-    if cfg.animation and not cfg.trim_start <= cfg.freeze_time < end:
+    if cfg.effect_clips is None and cfg.animation and not cfg.trim_start <= cfg.freeze_time < end:
         raise ValueError('The freeze moment must be inside the selected trim.')
     if not 0.8 <= cfg.orbit_seconds <= 15:
         raise ValueError('Animation duration must be between 0.8 and 15 seconds.')
@@ -165,13 +167,16 @@ def validate(cfg, info):
     if cfg.background_template not in ('none', 'particles', 'snow', 'embers', 'bokeh', 'rain',
                                        'stars', 'neon', 'grid', 'aurora', 'rays', 'vignette', 'media'):
         raise ValueError('Invalid background template.')
-    if cfg.background_template == 'media' and (not cfg.background_media or not os.path.isfile(cfg.background_media)):
+    if cfg.effect_clips is None and cfg.background_template == 'media' and (not cfg.background_media or not os.path.isfile(cfg.background_media)):
         raise ValueError('The selected background file is missing.')
     has_background = any([cfg.background_blur, cfg.background_dim, cfg.background_desaturate,
                           cfg.background_glow, cfg.background_particles, cfg.background_template != 'none'])
+    if cfg.effect_clips is not None:
+        _validate_effects(cfg, end)
+        has_background = any(c.get('kind') == 'background' and not c.get('muted') for c in cfg.effect_clips)
     if has_background and cfg.protected_time is not None and not cfg.trim_start <= cfg.protected_time < end:
         raise ValueError('The object selection frame must be inside the selected trim. Select it again at the freeze moment.')
-    if has_background and cfg.background_scope == 'freeze' and not cfg.animation:
+    if cfg.effect_clips is None and has_background and cfg.background_scope == 'freeze' and not cfg.animation:
         raise ValueError('Enable animation or choose background effects for the whole video.')
     if cfg.out and os.path.normcase(os.path.abspath(cfg.out)) == os.path.normcase(os.path.abspath(cfg.video)):
         raise ValueError('Choose an output name different from the original video.')
@@ -180,10 +185,14 @@ def validate(cfg, info):
 
 def timeline(cfg, count):
     """A single frame-accurate edit plan for video, audio, and displayed timings."""
+    if cfg.effect_clips is not None:
+        return _clip_timeline(cfg, count)
     fps = cfg.output_fps
     ff = min(max(round((cfg.freeze_time - cfg.trim_start) * fps), 0), count - 1)
     if not cfg.animation:
-        return dict(ff=ff, before=count, ramp_src=0, ramp_out=0, motion=0,
+        return dict(segments=[dict(kind='video', source_start=0, source_end=count,
+                                   output_start=0, output_end=count, speed=1, clip=None)],
+                    ff=ff, before=count, ramp_src=0, ramp_out=0, motion=0,
                     after=0, total_frames=count, freeze=count / fps, resume=count / fps,
                     ramp=count / fps, duration=count / fps)
     rs = min(round(0.5 * fps), ff) if cfg.slowmo else 0
@@ -192,6 +201,171 @@ def timeline(cfg, count):
     motion = round(cfg.orbit_seconds * fps)
     after = count - ff - 1
     total = before + ro + motion + after
-    return dict(ff=ff, before=before, ramp_src=rs, ramp_out=ro, motion=motion,
+    segments = []
+    if before:
+        segments.append(dict(kind='video', source_start=0, source_end=before,
+                             output_start=0, output_end=before, speed=1, clip=None))
+    if ro:
+        segments.append(dict(kind='ramp', source_start=before, source_end=ff,
+                             output_start=before, output_end=before + ro, speed=rs / ro, clip=None))
+    if motion:
+        segments.append(dict(kind='freeze', source_start=ff, source_end=ff + 1,
+                             output_start=before + ro, output_end=before + ro + motion, speed=0, clip=None))
+    if after:
+        segments.append(dict(kind='video', source_start=ff + 1, source_end=count,
+                             output_start=before + ro + motion, output_end=total, speed=1, clip=None))
+    return dict(segments=segments, ff=ff, before=before, ramp_src=rs, ramp_out=ro, motion=motion,
                 after=after, total_frames=total, freeze=(before + ro) / fps,
                 resume=(before + ro + motion) / fps, ramp=before / fps, duration=total / fps)
+
+
+EFFECT_KINDS = ('freeze', 'slowmo', 'clarity', 'flash', 'shake', 'glow', 'bars', 'scan', 'background')
+MOTION_STYLES = ('spin', 'hold', 'pulse', 'glitch', 'focus', 'tilt', 'scan')
+BACKGROUND_STYLES = ('none', 'particles', 'snow', 'embers', 'bokeh', 'rain', 'stars',
+                     'neon', 'grid', 'aurora', 'rays', 'vignette', 'media')
+
+
+def _finite(value):
+    return math.isfinite(float(value))
+
+
+def _validate_effects(cfg, end):
+    if not isinstance(cfg.effect_clips, list):
+        raise ValueError('Invalid timeline effects.')
+    identifiers, slow_intervals = set(), []
+    for clip in cfg.effect_clips:
+        if not isinstance(clip, dict) or clip.get('kind') not in EFFECT_KINDS:
+            raise ValueError('Invalid timeline effect.')
+        ident = str(clip.get('id', ''))
+        if not ident or ident in identifiers:
+            raise ValueError('Timeline effects need unique identifiers.')
+        identifiers.add(ident)
+        kind, params = clip['kind'], clip.get('params', {})
+        if not isinstance(params, dict):
+            raise ValueError('Invalid effect settings.')
+        if kind in ('freeze', 'slowmo'):
+            source = clip.get('source_time', cfg.trim_start)
+            if not _finite(source) or not cfg.trim_start <= source < end:
+                raise ValueError('The effect source moment must be inside the selected video.')
+            if kind == 'slowmo':
+                duration = clip.get('source_duration', 1)
+                speed = clip.get('speed', params.get('speed', .5))
+                if not _finite(duration) or duration <= 0 or source + duration > end + .01:
+                    raise ValueError('The slow-motion source interval must be inside the selected video.')
+                if not _finite(speed) or not .1 <= speed <= 1:
+                    raise ValueError('Slow-motion speed must be between 10 and 100 percent.')
+                if not clip.get('muted', False):
+                    slow_intervals.append((source, source + duration))
+            else:
+                duration = clip.get('duration', 1)
+                if not _finite(duration) or not .05 <= duration <= 60:
+                    raise ValueError('Freeze duration must be between 0.05 and 60 seconds.')
+                if params.get('motion_style', cfg.motion_style) not in MOTION_STYLES:
+                    raise ValueError('Invalid freeze motion template.')
+                if not _finite(params.get('orbit_angle', cfg.orbit_angle)) or not 0 <= params.get('orbit_angle', cfg.orbit_angle) <= 1080:
+                    raise ValueError('Rotation must be between 0 and 1080 degrees.')
+                if params.get('rotation_direction', cfg.rotation_direction) not in (-1, 1):
+                    raise ValueError('Invalid rotation direction.')
+        else:
+            if not _finite(clip.get('time', 0)) or clip.get('time', 0) < 0:
+                raise ValueError('Effect times cannot be negative.')
+            if not _finite(clip.get('duration', 1)) or clip.get('duration', 1) <= 0:
+                raise ValueError('Effect duration must be positive.')
+        for key in ('strength', 'motion_strength', 'background_strength'):
+            if key in params and (not _finite(params[key]) or not 0 <= params[key] <= 1):
+                raise ValueError('Effect strength must be between 0 and 100 percent.')
+        if kind == 'background':
+            if params.get('background_template', 'none') not in BACKGROUND_STYLES:
+                raise ValueError('Invalid background template.')
+            for key, low, high in (('background_blur', 0, 40), ('background_dim', 0, .85),
+                                   ('background_speed', .1, 4), ('mask_feather', 0, 20)):
+                if key in params and (not _finite(params[key]) or not low <= params[key] <= high):
+                    raise ValueError('Invalid background settings.')
+            if params.get('background_template') == 'media' and not os.path.isfile(params.get('background_media') or ''):
+                raise ValueError('The selected background file is missing.')
+    slow_intervals.sort()
+    for previous, current in zip(slow_intervals, slow_intervals[1:]):
+        if current[0] < previous[1] - 1e-7:
+            raise ValueError('Slow-motion source intervals cannot overlap. Move or trim one of them.')
+
+
+def _clip_timeline(cfg, count):
+    fps, count = cfg.output_fps, max(1, count)
+    freezes, slows = {}, []
+    boundaries = {0, count}
+    for clip in cfg.effect_clips:
+        if clip.get('muted', False):
+            continue
+        kind = clip.get('kind')
+        if kind not in ('freeze', 'slowmo'):
+            continue
+        start = min(count - 1, max(0, round((clip['source_time'] - cfg.trim_start) * fps)))
+        if kind == 'freeze':
+            freezes.setdefault(start, []).append(clip)
+            boundaries.update((start, start + 1))
+        else:
+            stop = min(count, max(start + 1, round((clip['source_time'] + clip['source_duration'] - cfg.trim_start) * fps)))
+            speed = float(clip.get('speed', clip.get('params', {}).get('speed', .5)))
+            slows.append((start, stop, speed, clip))
+            boundaries.update((start, stop))
+    segments, cursor = [], 0
+
+    def add(kind, start, stop, length, clip=None):
+        nonlocal cursor
+        length = max(1, length)
+        segments.append(dict(kind=kind, source_start=start, source_end=stop,
+                             output_start=cursor, output_end=cursor + length,
+                             speed=0 if kind == 'freeze' else (stop - start) / length,
+                             clip=clip))
+        cursor += length
+
+    points = sorted(boundaries)
+    for start, stop in zip(points, points[1:]):
+        if start in freezes:
+            for clip in freezes[start]:
+                add('freeze', start, start + 1, round(clip['duration'] * fps), clip)
+            # The held source frame replaces this single original frame, once.
+            continue
+        if stop <= start:
+            continue
+        slow = next((s for s in slows if s[0] <= start < s[1]), None)
+        add('slowmo' if slow else 'video', start, stop,
+            round((stop - start) / slow[2]) if slow else stop - start,
+            slow[3] if slow else None)
+    first = next((s for s in segments if s['kind'] == 'freeze'), None)
+    ff = first['source_start'] if first else 0
+    freeze = first['output_start'] / fps if first else cursor / fps
+    resume = first['output_end'] / fps if first else cursor / fps
+    motion = first['output_end'] - first['output_start'] if first else 0
+    return dict(segments=segments, total_frames=cursor, duration=cursor / fps,
+                ff=ff, before=first['output_start'] if first else cursor,
+                ramp_src=0, ramp_out=0, motion=motion,
+                after=max(0, cursor - (first['output_end'] if first else cursor)),
+                freeze=freeze, resume=resume, ramp=freeze)
+
+
+def source_frame_to_output(plan, frame, fps):
+    """Map an original source frame into the shared output plan."""
+    frame = max(0, frame)
+    for segment in plan['segments']:
+        if segment['source_start'] <= frame < segment['source_end']:
+            if segment['kind'] == 'freeze':
+                return segment['output_start'] / fps
+            return (segment['output_start'] + (frame - segment['source_start']) / segment['speed']) / fps
+    return plan['duration']
+
+
+def effect_span(cfg, info, clip):
+    """Return output seconds for a timeline effect, including source-mapped holds."""
+    if clip.get('kind') not in ('freeze', 'slowmo'):
+        return float(clip.get('time', 0)), float(clip.get('duration', 1))
+    end = cfg.trim_end if cfg.trim_end is not None else info['duration']
+    count = max(1, round((end - cfg.trim_start) * cfg.output_fps))
+    plan = timeline(cfg, count)
+    spans = [s for s in plan.get('segments', []) if s.get('clip') and s['clip'].get('id') == clip.get('id')]
+    if spans:
+        return spans[0]['output_start'] / cfg.output_fps, (spans[-1]['output_end'] - spans[0]['output_start']) / cfg.output_fps
+    source_frame = (clip.get('source_time', cfg.trim_start) - cfg.trim_start) * cfg.output_fps
+    start = source_frame_to_output(plan, source_frame, cfg.output_fps) if 'segments' in plan else max(0, source_frame / cfg.output_fps)
+    duration = clip.get('duration', 1) if clip['kind'] == 'freeze' else clip.get('source_duration', 1) / clip.get('speed', clip.get('params', {}).get('speed', .5))
+    return start, duration

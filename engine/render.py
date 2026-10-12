@@ -13,6 +13,7 @@ from .motion import Motion, finish
 from .background import ProtectionTracker, apply_background, enabled as background_enabled
 from .sound import make_soundtrack
 from .templates import close_media
+from .effects import motion_config, backgrounds_at, timed_background, timed_visuals
 from .util import APP_DIR, CACHE_DIR, Cancelled, FFMPEG, popen, probe_frames, run
 
 
@@ -74,7 +75,9 @@ def run_montage(cfg, log=print, progress=lambda f: None, cancel=None):
         progress(0.12)
         mask = region_mask((h, w), cfg.hud_regions if cfg.remove_hud else [])
         cleaner = HUDCleaner(mask, src, cfg.hud_method, check)
-        if background_enabled(cfg) and cfg.protected_polygons:
+        has_background = background_enabled(cfg) if cfg.effect_clips is None else any(
+            c.get('kind') == 'background' and not c.get('muted', False) for c in cfg.effect_clips)
+        if has_background and cfg.protected_polygons:
             anchor = (cfg.protected_time if cfg.protected_time is not None else cfg.freeze_time) - cfg.trim_start
             anchor = min(max(anchor, 0), (count - 1) / fps)
             tracker = ProtectionTracker(src, cfg.protected_polygons, anchor, (h, w), check)
@@ -82,15 +85,16 @@ def run_montage(cfg, log=print, progress=lambda f: None, cancel=None):
         if not cap.isOpened():
             raise RuntimeError('Could not open the prepared video.')
         freeze = None
-        if cfg.animation:
+        legacy_animation = cfg.effect_clips is None and cfg.animation
+        if legacy_animation:
             cap.set(cv2.CAP_PROP_POS_FRAMES, plan['ff'])
             ok, freeze = cap.read()
             if not ok:
                 raise RuntimeError('Could not decode the selected freeze frame.')
             freeze = cleaner.clean(freeze, plan['ff'] / fps)
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        protected = tracker.at(plan['ff'] / fps, freeze) if tracker is not None and cfg.animation else None
-        motion = Motion(freeze, cfg, plan['motion'], protected) if cfg.animation else None
+        protected = tracker.at(plan['ff'] / fps, freeze) if tracker is not None and legacy_animation else None
+        motion = Motion(freeze, cfg, plan['motion'], protected) if legacy_animation else None
         log('Creating audio mix')
         total = plan['duration']
         game = audio(cfg.video, os.path.join(work, 'game.wav'), cfg.trim_start,
@@ -120,7 +124,11 @@ def run_montage(cfg, log=print, progress=lambda f: None, cancel=None):
             dest = audio(item['path'], os.path.join(work, f'fx_{i}.wav'),
                          start=item.get('source_in', 0), duration=length)
             effects.append((dest, item['time'], item['volume']*track.get('volume',1), item.get('fade_in', 0), item.get('fade_out', 0)))
-        if cfg.animation:
+        if cfg.effect_clips is not None:
+            segments = [(s['output_start'] / fps, s['source_start'] / fps,
+                         (s['output_end'] - s['output_start']) / fps, 0, 0, s['speed'])
+                        for s in plan['segments'] if s['kind'] != 'freeze']
+        elif cfg.animation:
             segments = [(0, 0, plan['ramp'], 0.01, 0.08),
                         (plan['resume'], (plan['ff'] + 1) / fps, plan['after'] / fps, 0.04, 0.1)]
         else:
@@ -130,8 +138,8 @@ def run_montage(cfg, log=print, progress=lambda f: None, cancel=None):
         make_soundtrack(total, plan['ramp'], plan['freeze'], plan['resume'],
                         max(0.3, cfg.orbit_seconds - 0.3), music, game, segments, sound,
                         music_gain=cfg.music_volume, game_gain=cfg.game_volume,
-                        fx_gain=cfg.fx_volume if cfg.builtin_fx and cfg.animation else 0,
-                        custom_effects=effects)
+                        fx_gain=cfg.fx_volume if cfg.builtin_fx and legacy_animation else 0,
+                        custom_effects=effects, legacy_treatment=(cfg.effect_clips is None))
         check()
         progress(0.2)
         log('Restoring selected HUD regions and rendering animation' if mask.any() else 'Rendering montage')
@@ -146,10 +154,10 @@ def run_montage(cfg, log=print, progress=lambda f: None, cancel=None):
                     stdin=subprocess.PIPE, stderr=err_file)
         done = 0
 
-        def send(frame):
+        def send(frame, finish_frame=True):
             nonlocal done
             check()
-            enc.stdin.write(finish(frame, cfg).tobytes())
+            enc.stdin.write((finish(frame, cfg) if finish_frame else frame).tobytes())
             done += 1
             if done % max(1, fps // 2) == 0:
                 progress(0.2 + 0.72 * done / plan['total_frames'])
@@ -161,8 +169,35 @@ def run_montage(cfg, log=print, progress=lambda f: None, cancel=None):
                 cleaned = apply_background(cleaned, protected, cfg, index / fps)
             return cleaned
 
+        if cfg.effect_clips is not None:
+            cached_index, cached_frame = -1, None
+            for segment in plan['segments']:
+                check()
+                motion = None
+                for output_index in range(segment['output_start'], segment['output_end']):
+                    check()
+                    local_index = output_index - segment['output_start']
+                    index = min(count - 1, round(segment['source_start'] + local_index * segment['speed']))
+                    if index != cached_index:
+                        if round(cap.get(cv2.CAP_PROP_POS_FRAMES)) != index:
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+                        ok, frame = cap.read()
+                        if not ok:
+                            raise RuntimeError(f'Could not decode source frame {index}/{count}.')
+                        cached_frame = cleaner.clean(frame, index / fps)
+                        cached_index = index
+                    frame = cached_frame.copy()
+                    output_time = output_index / fps
+                    mask = tracker.at(index / fps, frame) if tracker is not None and backgrounds_at(cfg, output_time) else None
+                    prepared = timed_background(frame, mask, cfg, output_time)
+                    if segment['kind'] == 'freeze':
+                        if motion is None:
+                            motion = Motion(frame, motion_config(cfg, segment['clip']),
+                                            segment['output_end'] - segment['output_start'])
+                        prepared = motion.frame(local_index, source_frame=prepared)
+                    send(timed_visuals(prepared, cfg, output_time), finish_frame=False)
         ramp_frames = []
-        for index in range(count):
+        for index in range(count) if cfg.effect_clips is None else ():
             check()
             ok, frame = cap.read()
             if not ok:

@@ -22,6 +22,8 @@ from .tracks import AudioTimeline,MediaAnalysis
 from .audio import LiveAudio,EffectsAudio
 from .library import Library
 from .panels import Section
+from .effect_editor import EffectEditor,EFFECT_NAMES
+from engine.sound import builtin_sound
 
 
 def label(text,kind=None):
@@ -44,8 +46,9 @@ def seconds(value=0):
 def stamp(value): return f'{int(max(0,value)//60):02}:{max(0,value)%60:06.3f}'
 
 
-class StudioFeatures:
+class StudioFeatures(EffectEditor):
     def __init__(self):
+        self.effect_clips=[]; self.syncing_effect=False; self.removed_assets=set()
         self.audio_clips=[]; self.audio_tracks=[]; self.selected_track_id=None; self.syncing_track=False
         self.pending_audio_track=None; self.pending_audio_time=None
         self.analysis={}; self.analysis_jobs=[]; self.fx_jobs=[]
@@ -55,7 +58,7 @@ class StudioFeatures:
         self.proxy_jobs=[]
         self.background_color='#73e0bd'; self.loading_project=False
         super().__init__()
-        self.setWindowTitle('Montage Maker Studio 3')
+        self.setWindowTitle('Montage Maker Studio 4')
         self.resize(1530,1010); self.setMinimumSize(1100,820)
         self.player.stop(); self.player.setVideoSink(None)
         self.live_frames=LiveFrames(self)
@@ -101,7 +104,7 @@ class StudioFeatures:
         vertical=QSplitter(Qt.Vertical); vertical.setLayoutDirection(Qt.LeftToRight); root.addWidget(vertical,1)
         self.main_splitter=QSplitter(Qt.Horizontal); self.main_splitter.setLayoutDirection(Qt.LeftToRight)
         self.library=Library(); self.library.setMinimumWidth(290); self.library.setMaximumWidth(440)
-        self.library.imported.connect(self.import_media); self.library.used.connect(self.use_asset)
+        self.library.imported.connect(self.import_media); self.library.used.connect(self.use_asset); self.library.removed.connect(self.remove_asset); self.library.sound.connect(self.add_builtin_sound)
         self.library.motion.connect(self.choose_motion); self.library.background.connect(self.choose_background); self.library.page.connect(self.library_page)
         self.background_buttons=self.library.background_buttons; self.background_group=self.library.background_group
         self.main_splitter.addWidget(self.library)
@@ -138,7 +141,7 @@ class StudioFeatures:
         self.sidebar=QTabWidget(); self.sidebar.setLayoutDirection(Qt.RightToLeft); inspector_box.addWidget(self.sidebar,1)
         self.main_splitter.addWidget(inspector); self.main_splitter.setSizes([385,735,350]); vertical.addWidget(self.main_splitter)
         bottom=QFrame(); bottom.setObjectName('card'); timeline_box=QVBoxLayout(bottom); timeline_box.setContentsMargins(8,7,8,7); timeline_box.setSpacing(4)
-        toolbar=QHBoxLayout(); toolbar.addWidget(button('+ صوت',self.add_fx)); toolbar.addWidget(button('+ مسار',self.add_empty_track)); toolbar.addWidget(button('تقسيم',self.split_audio)); toolbar.addWidget(button('تراجع',self.undo_audio)); toolbar.addWidget(button('إعادة',self.redo_audio))
+        toolbar=QHBoxLayout(); toolbar.addWidget(button('+ تجميد',lambda:self.add_effect('freeze'))); toolbar.addWidget(button('+ تأثير',lambda:self.sidebar.setCurrentIndex(0))); toolbar.addWidget(button('+ صوت',self.add_fx)); toolbar.addWidget(button('+ مسار',self.add_empty_track)); toolbar.addWidget(button('تقسيم',self.split_audio)); toolbar.addWidget(button('تراجع',self.undo_audio)); toolbar.addWidget(button('إعادة',self.redo_audio))
         self.summary=label('','muted'); toolbar.addWidget(self.summary,1)
         self.cut_toggle=button('قص الأصل ▾',lambda:self.source_cut.setVisible(not self.source_cut.isVisible())); toolbar.addWidget(self.cut_toggle)
         toolbar.addWidget(label('تكبير المسار','muted')); self.track_zoom=QSlider(Qt.Horizontal); self.track_zoom.setRange(100,800); self.track_zoom.setValue(100); self.track_zoom.setMaximumWidth(105); toolbar.addWidget(self.track_zoom); timeline_box.addLayout(toolbar)
@@ -148,13 +151,13 @@ class StudioFeatures:
         for text,fn in [('البداية من هنا',self.mark_in),('النهاية هنا',self.mark_out),('تجميد هنا',self.mark_freeze)]: trimrow.addWidget(button(text,fn))
         trimrow.addStretch(); source_box.addWidget(self.trim_toolbar); self.source_cut.hide(); timeline_box.addWidget(self.source_cut)
         self.audio_timeline=AudioTimeline(); self.audio_timeline.scroll.setMaximumHeight(16777215); self.audio_timeline.setMinimumHeight(180)
-        self.audio_timeline.canvas.clips=self.audio_clips; self.audio_timeline.canvas.tracks=self.audio_tracks
+        self.audio_timeline.canvas.clips=self.audio_clips; self.audio_timeline.canvas.tracks=self.audio_tracks; self.audio_timeline.canvas.effects=self.effect_clips
         self.audio_timeline.seek.connect(self.seek_output); self.audio_timeline.selected.connect(self.select_audio_clip); self.audio_timeline.changed.connect(self.clips_changed); self.track_zoom.valueChanged.connect(self.audio_timeline.set_zoom)
-        canvas=self.audio_timeline.canvas; canvas.addAudio.connect(self.add_audio_at); canvas.addTrack.connect(self.add_empty_track); canvas.trackSelected.connect(self.select_audio_track); canvas.videoSelected.connect(self.select_video)
+        canvas=self.audio_timeline.canvas; canvas.statusMessage.connect(lambda text:self.status.setText(text)); canvas.effectSelected.connect(self.select_effect); canvas.addEffect.connect(self.add_effect); canvas.addAudio.connect(self.add_audio_at); canvas.addTrack.connect(self.add_empty_track); canvas.trackSelected.connect(self.select_audio_track); canvas.videoSelected.connect(self.select_video)
         canvas.gameSelected.connect(self.select_game_audio); canvas.musicSelected.connect(self.select_music_audio)
         canvas.trimStart.connect(lambda t:self.trim_in.setValue(min(t,self.trim_out.value()-.25))); canvas.trimEnd.connect(lambda t:self.trim_out.setValue(max(t,self.trim_in.value()+.25))); canvas.freezeHere.connect(self.set_freeze); canvas.fileDropped.connect(self.drop_asset)
         timeline_box.addWidget(self.audio_timeline,1); vertical.addWidget(bottom); vertical.setSizes([560,360])
-        self.make_edit_tab(); self.make_background_tab(); self.make_audio_tab(); self.make_export_tab()
+        self.make_edit_tab(); self.make_background_tab(); self.make_audio_tab(); self.make_export_tab(); self.make_effect_tab()
         canvas.gameMute.connect(lambda muted:self.game_enabled.setChecked(not muted)); canvas.musicMute.connect(self.music_mute.setChecked)
         footer=QHBoxLayout(); self.status=label('كلك يمين على المسارات للإضافة والتحكم. كل تعديل يظهر مباشرة.','muted'); footer.addWidget(self.status,1)
         self.preview_btn=QPushButton(''); self.preview_btn.hide(); self.cancel_btn=button('إلغاء',self.cancel_job); self.cancel_btn.hide(); footer.addWidget(self.cancel_btn)
@@ -179,27 +182,22 @@ class StudioFeatures:
                 elif w.text()=='معاينة قبل التصدير': w.setText('عرض مباشر أثناء التحرير')
 
     def make_edit_tab(self):
-        box=self.tab('الفيديو'); trim=Section('القص واللقطة',True); box.addWidget(trim)
+        box=self.tab('الفيديو'); trim=Section('قص الأصل',True); box.addWidget(trim)
         form=QFormLayout(); self.trim_in=seconds(); self.trim_out=seconds(); self.freeze=seconds(3)
-        for text,w in [('البداية',self.trim_in),('النهاية',self.trim_out),('لحظة التجميد',self.freeze)]: form.addRow(text,w); w.valueChanged.connect(self.edit_changed)
+        for text,w in [('البداية',self.trim_in),('النهاية',self.trim_out)]: form.addRow(text,w); w.valueChanged.connect(self.edit_changed)
         trim.box.addLayout(form)
-        self.animation=QCheckBox('تجميد وحركة'); self.animation.setChecked(True); box.addWidget(self.animation)
-        self.motion_section=Section('حركة اللقطة',True); box.addWidget(self.motion_section); form=QFormLayout()
+        # Retained fields load old projects; new changes are timeline instances.
+        self.animation=QCheckBox(); self.motion_section=Section('',False); self.rotation_section=Section('',False)
         self.motion_template=QComboBox()
         for key,title,glyph in MOTION_TEMPLATES: self.motion_template.addItem(title,key)
-        self.motion_template.currentIndexChanged.connect(self.motion_changed); form.addRow('القالب',self.motion_template)
-        self.motion_duration=seconds(3); self.motion_duration.setRange(.8,15); self.motion_duration.valueChanged.connect(self.invalidate); form.addRow('المدة',self.motion_duration)
-        self.motion_strength=QSlider(Qt.Horizontal); self.motion_strength.setRange(0,100); self.motion_strength.setValue(65); self.motion_strength.valueChanged.connect(self.invalidate); form.addRow('قوة التأثير',self.motion_strength); self.motion_section.box.addLayout(form)
-        self.rotation_section=Section('الدوران',True); self.motion_section.box.addWidget(self.rotation_section); form=QFormLayout()
-        self.angle=QDoubleSpinBox(); self.angle.setRange(0,1080); self.angle.setValue(360); self.angle.setDecimals(1); self.angle.setSingleStep(15); self.angle.setSuffix('°'); self.angle.valueChanged.connect(self.invalidate)
-        self.direction=QComboBox(); self.direction.addItem('مع عقارب الساعة',-1); self.direction.addItem('عكس عقارب الساعة',1); self.direction.currentIndexChanged.connect(self.invalidate)
-        form.addRow('الزاوية',self.angle); form.addRow('الاتجاه',self.direction); self.rotation_section.box.addLayout(form)
-        row=QHBoxLayout()
-        for text,value in [('0°',0),('90°',90),('180°',180),('360°',360)]: row.addWidget(button(text,lambda checked=False,v=value:self.angle.setValue(v)))
-        self.rotation_section.box.addLayout(row); self.animation.toggled.connect(self.invalidate)
-        looks=Section('تأثيرات الصورة',False); box.addWidget(looks); self.options={}
-        for key,text,checked in [('slowmo','تباطؤ قبل التجميد',True),('clarity','ألوان ووضوح',True),('flash','فلاش',True),('glow','وهج',False),('scan','مسح ضوئي',False),('shake','اهتزاز الرجعة',True),('bars','أشرطة سينما',False)]:
-            w=QCheckBox(text); w.setChecked(checked); w.toggled.connect(self.invalidate); self.options[key]=w; looks.box.addWidget(w)
+        self.motion_duration=seconds(3); self.motion_strength=QSlider(Qt.Horizontal); self.motion_strength.setRange(0,100); self.motion_strength.setValue(65)
+        self.angle=QDoubleSpinBox(); self.angle.setRange(0,1080); self.angle.setValue(360); self.direction=QComboBox(); self.direction.addItem('مع عقارب الساعة',-1); self.direction.addItem('عكس عقارب الساعة',1)
+        self.options={key:QCheckBox() for key in ('slowmo','clarity','flash','glow','scan','shake','bars')}
+        add=Section('إضافة تأثير عند المؤشر',True); box.addWidget(add); grid=QGridLayout()
+        for i,(kind,title) in enumerate(EFFECT_NAMES.items()):
+            if kind=='background': continue
+            grid.addWidget(button('+ '+title,lambda checked=False,k=kind:self.add_effect(k)),i//2,i%2)
+        add.box.addLayout(grid); add.box.addWidget(label('تقدر تضيف كل تأثير أكثر من مرة. اسحب مقطعه أو طرفيه فوق مسار الفيديو، أو كلك يمين لخصائصه.','muted'))
         hud=Section('إخفاء HUD',False); box.addWidget(hud); self.hud_enabled=QCheckBox('إخفاء المناطق المحددة'); self.hud_enabled.toggled.connect(self.invalidate); hud.box.addWidget(self.hud_enabled)
         self.hud_method=QComboBox(); self.hud_method.addItem('ترميم زمني','temporal'); self.hud_method.addItem('ترميم سريع','fast'); self.hud_method.currentIndexChanged.connect(self.invalidate); hud.box.addWidget(self.hud_method)
         hud.box.addWidget(label('الكادر يبقى كاملًا. الترميم في المناطق المختارة تقديري.','muted')); box.addStretch()
@@ -215,7 +213,8 @@ class StudioFeatures:
         self.bg_speed=QDoubleSpinBox(); self.bg_speed.setRange(.1,4); self.bg_speed.setValue(1); self.bg_speed.setSingleStep(.1); self.bg_speed.setSuffix(' ×'); self.bg_speed.valueChanged.connect(self.invalidate)
         self.bg_color_btn=button('اختيار اللون',self.pick_background_color)
         self.bg_scope=QComboBox(); self.bg_scope.addItem('أثناء التجميد','freeze'); self.bg_scope.addItem('كل الفيديو مع التتبع','all'); self.bg_scope.currentIndexChanged.connect(self.invalidate)
-        for text,w in [('القوة',self.bg_strength),('السرعة',self.bg_speed),('اللون',self.bg_color_btn),('التطبيق',self.bg_scope)]: form.addRow(text,w)
+        self.bg_scope.hide()
+        for text,w in [('القوة',self.bg_strength),('السرعة',self.bg_speed),('اللون',self.bg_color_btn)]: form.addRow(text,w)
         template.box.addLayout(form)
         look=Section('الغباش والإضاءة',True); box.addWidget(look); form=QFormLayout()
         self.bg_blur=QDoubleSpinBox(); self.bg_blur.setRange(0,40); self.bg_blur.setSingleStep(2); self.bg_blur.valueChanged.connect(self.invalidate)
@@ -225,6 +224,9 @@ class StudioFeatures:
             w=QCheckBox(text); w.toggled.connect(self.invalidate); self.bg_options[key]=w; look.box.addWidget(w)
         selection=Section('حدود العنصر المحمي',False); box.addWidget(selection); form=QFormLayout()
         self.mask_feather=QDoubleSpinBox(); self.mask_feather.setRange(0,20); self.mask_feather.setValue(2); self.mask_feather.setSingleStep(.5); self.mask_feather.setSuffix(' px'); self.mask_feather.valueChanged.connect(self.invalidate); form.addRow('نعومة الحدود',self.mask_feather); selection.box.addLayout(form)
+        for control in (self.bg_strength,self.bg_speed,self.bg_blur,self.bg_dim,self.mask_feather): control.valueChanged.connect(self.background_fields_changed)
+        for control in self.bg_options.values(): control.toggled.connect(self.background_fields_changed)
+        box.addWidget(button('توقيت الخلفية المحددة',lambda:self.select_effect(self.selected_effect()['id']) if self.selected_effect() else None))
         selection.box.addWidget(label('حماية العنصر فوق شاشة الفيديو. تكبير الشاشة لا يغيّر حجم الفيديو النهائي.','muted')); box.addStretch()
 
     def make_audio_tab(self):
@@ -248,7 +250,7 @@ class StudioFeatures:
         fade.box.addLayout(form)
         source=Section('صوت الفيديو والمؤثرات',False); self.source_audio_section=source; box.addWidget(source)
         self.game_enabled=QCheckBox('صوت الفيديو'); self.game_enabled.setChecked(True); self.game_enabled.toggled.connect(self.invalidate); source.box.addWidget(self.game_enabled); self.game_volume=self.volume_control(source.box,'المستوى',60)
-        self.builtin_fx=QCheckBox('مؤثرات التجميد والرجعة'); self.builtin_fx.setChecked(True); self.builtin_fx.toggled.connect(self.invalidate); source.box.addWidget(self.builtin_fx); self.fx_volume=self.volume_control(source.box,'المؤثرات',60)
+        self.builtin_fx=QCheckBox('مؤثرات التجميد والرجعة'); self.builtin_fx.setChecked(False); self.builtin_fx.toggled.connect(self.invalidate); source.box.addWidget(self.builtin_fx); self.fx_volume=self.volume_control(source.box,'المؤثرات',60); self.builtin_fx.hide(); self.fx_volume.hide(); source.box.addWidget(label('أصوات التجميد والرجعة تختارها من مكتبة الصوت، كمقاطع مستقلة.','muted'))
         music=Section('موسيقى رئيسية',False); self.music_section=music; box.addWidget(music); self.music_path=None; self.music_name=label('لم تضف موسيقى','muted'); music.box.addWidget(self.music_name)
         row=QHBoxLayout(); row.addWidget(button('اختيار',self.pick_music)); row.addWidget(button('إزالة',self.clear_music)); music.box.addLayout(row)
         self.music_start=seconds(); self.drop_time=seconds(); self.drop_enabled=QCheckBox('مزامنة الدروب مع الرجعة')
@@ -271,7 +273,7 @@ class StudioFeatures:
         filter='Audio (*.mp3 *.wav *.m4a *.aac *.ogg *.flac *.opus)' if audio_only else 'Media (*.mp4 *.mov *.mkv *.webm *.avi *.mp3 *.wav *.m4a *.aac *.ogg *.flac *.opus *.jpg *.jpeg *.png *.webp *.bmp)'
         paths,_=QFileDialog.getOpenFileNames(self,'استيراد وسائط','',filter)
         for path in paths:
-            self.library.add_file(path); kind=self.library.assets[path]['kind']
+            self.removed_assets.discard(path); self.library.add_file(path); kind=self.library.assets[path]['kind']
             if kind!='image': self.analyze(path,kind=='video')
             if kind=='video' and not self.video: self.choose_video(path)
 
@@ -280,7 +282,7 @@ class StudioFeatures:
 
     def drop_asset(self,path,t,track):
         if self.busy: return
-        self.library.add_file(path); kind=self.library.assets[path]['kind']
+        self.removed_assets.discard(path); self.library.add_file(path); kind=self.library.assets[path]['kind']
         if kind=='audio':
             if track is not None and self.audio_timeline.canvas.track_info(track).get('locked'): self.status.setText('أزل قفل المسار أولًا.'); return
             self.audio_timeline.canvas.remember(); self.pending_audio_track=track
@@ -288,7 +290,7 @@ class StudioFeatures:
             finally: self.pending_audio_track=None
             self.clips_changed(); self.select_audio_clip(self.audio_clips[-1]['id'])
         elif kind=='image':
-            self.background_media=path; self.selected_background='media'; self.background_buttons['media'].setChecked(True); self.sidebar.setCurrentIndex(1); self.invalidate()
+            self.background_media=path; self.selected_background='media'; self.background_buttons['media'].setChecked(True); self.add_effect('background',t=t,params=self.background_params()); self.sidebar.setCurrentIndex(1)
         else: self.choose_video(path)
 
     def library_page(self,key):
@@ -298,7 +300,7 @@ class StudioFeatures:
         elif key=='export': self.sidebar.setCurrentIndex(3)
 
     def choose_motion(self,key):
-        self.motion_template.setCurrentIndex(self.motion_template.findData(key)); self.motion_section.set_open(True); self.sidebar.setCurrentIndex(0)
+        self.add_effect('freeze',params=dict(motion_style=key,orbit_angle=360,rotation_direction=1,motion_strength=.65))
 
     def select_video(self):
         self.inspector_caption.setText('خصائص الفيديو'); self.sidebar.setCurrentIndex(0)
@@ -347,6 +349,7 @@ class StudioFeatures:
 
     def config(self):
         cfg=super().config()
+        cfg.effect_clips=copy.deepcopy(self.effect_clips); cfg.builtin_fx=False
         cfg.sound_effects=copy.deepcopy(self.audio_clips)
         cfg.audio_tracks=copy.deepcopy(self.audio_tracks)
         cfg.protected_polygons=copy.deepcopy(self.view.protected)
@@ -364,6 +367,26 @@ class StudioFeatures:
         if self.info and hasattr(self,'summary') and hasattr(self,'quality'):
             cfg=self.config(); plan=edit_plan(cfg,self.info)
             self.summary.setText(f'المصدر: {self.trim_out.value()-self.trim_in.value():.2f} ث  ·  المونتاج: {plan["duration"]:.2f} ث')
+
+    def edit_changed(self,*args):
+        if not self.info: return
+        start,end=self.trim_in.value(),self.trim_out.value()
+        if end-start<.25: return
+        if not self.loading_project:
+            self.pause_live(); kept=[]
+            for clip in self.effect_clips:
+                if clip['kind']=='freeze' and not start<=clip['source_time']<end: continue
+                if clip['kind']=='slowmo':
+                    a=max(start,clip['source_time']); b=min(end,clip['source_time']+clip['source_duration'])
+                    if b-a<.02: continue
+                    clip.update(source_time=a,source_duration=b-a)
+                kept.append(clip)
+            self.effect_clips[:]=kept
+            if self.protected_time is not None and not start<=self.protected_time<end:
+                self.protected_time=start
+            if self.live_audio: self.live_audio.discontinuity()
+        self.freeze.setRange(start,max(start,end-1/self.info['fps']))
+        self.refresh_effect_combo(); self.refresh_effect_fields(); self.update_track(); self.invalidate()
 
     def update_track(self):
         if not hasattr(self,'track') or not self.info: return
@@ -391,6 +414,7 @@ class StudioFeatures:
         if self.busy: return
         self.pause_live()
         super().choose_video(path)
+        if not self.loading_project: self.effect_clips.clear(); self.audio_timeline.canvas.selected_effect_id=None
         self.audio_timeline.canvas.history.clear(); self.audio_timeline.canvas.future.clear(); self.selected_track_id=None
         self.library.add_file(self.video,'video')
         self.game_enabled.setEnabled(self.info['audio'])
@@ -426,11 +450,11 @@ class StudioFeatures:
         rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
         image=QImage(rgb.data,rgb.shape[1],rgb.shape[0],rgb.strides[0],QImage.Format_RGB888).copy()
         self.view.frame(image)
-        if self.mode!='source': self.source_position=source
+        if self.mode!='source' and not self.live_playing: self.source_position=source
         self.update_positions()
 
     def tick(self):
-        now=time.monotonic(); dt=min(.2,now-self.last_tick); self.last_tick=now
+        now=time.monotonic(); dt=max(0,now-self.last_tick); self.last_tick=now
         if not self.info or self.busy: return
         cfg=self.config(); plan=edit_plan(cfg,self.info)
         if self.live_playing:
@@ -489,6 +513,7 @@ class StudioFeatures:
     def seek_output(self,t):
         if not self.info: return
         self.commit_selection(); self.pause_live()
+        if self.live_audio: self.live_audio.discontinuity()
         self.mode='live'; self.view.source=False; self.view.protecting=self.view.selecting=False
         self.protect_btn.setChecked(False); self.select_hud.setChecked(False)
         self.draft_btn.setChecked(True); self.original_btn.setChecked(False); self.mode_label.setText('LIVE')
@@ -513,6 +538,7 @@ class StudioFeatures:
     def switch(self,mode):
         if not self.video or self.busy: return
         self.pause_live(); self.commit_selection()
+        if self.live_audio: self.live_audio.discontinuity()
         if mode!='source':
             if self.mode=='source': self.output_position=source_to_output(self.config(),self.info,self.source_position)
             self.mode='live'; self.view.source=False; self.view.protecting=self.view.selecting=False
@@ -584,16 +610,18 @@ class StudioFeatures:
         if self.live_audio: self.live_audio.master=value/100
 
     def choose_background(self,key,color):
+        if self.busy: return
         if key=='media':
             path,_=QFileDialog.getOpenFileName(self,'خلفية صورة أو فيديو','','Media (*.png *.jpg *.jpeg *.webp *.bmp *.mp4 *.mov *.mkv *.webm)')
-            if not path:
-                self.background_buttons[getattr(self,'selected_background','none')].setChecked(True); return
+            if not path: return
             self.background_media=path
-        self.selected_background=key; self.background_color=color; self.sidebar.setCurrentIndex(1); self.inspector_caption.setText('خصائص الخلفية'); self.invalidate()
+        self.selected_background=key; self.background_color=color
+        clip=self.add_effect('background',params=self.background_params())
+        if clip: self.sidebar.setCurrentIndex(1); self.inspector_caption.setText('خصائص الخلفية المحددة')
 
     def pick_background_color(self):
         color=QColorDialog.getColor(QColor(self.background_color),self,'لون القالب')
-        if color.isValid(): self.background_color=color.name(); self.invalidate()
+        if color.isValid(): self.background_color=color.name(); self.background_fields_changed(); self.invalidate()
 
     def analyze(self,path,video=False):
         if path in self.analysis_cache:
@@ -613,7 +641,7 @@ class StudioFeatures:
 
     def analysis_ready(self,path,data):
         self.analysis_cache[path]=data
-        self.library.metadata(path,data)
+        if path not in self.removed_assets: self.library.metadata(path,data)
         canvas=self.audio_timeline.canvas; canvas.waveforms[path]=data['wave']
         if path==self.video:
             canvas.game_wave=data['wave']; canvas.thumbnails=data['thumbnails']
@@ -650,6 +678,7 @@ class StudioFeatures:
             source['duration']=max(.05,min(source['duration'],edit_plan(self.config(),self.info)['duration']-t))
         source.setdefault('fade_in',0); source.setdefault('fade_out',0)
         source.setdefault('muted',False); source.setdefault('locked',False)
+        self.removed_assets.discard(path)
         source['track']=self.add_track_model(source.get('track') if source.get('track') is not None else self.pending_audio_track)
         self.library.add_file(path,'audio')
         self.audio_clips.append(source); self.analyze(path)
@@ -662,9 +691,9 @@ class StudioFeatures:
         if not hasattr(self,'clip_combo'): return
         ident=self.audio_timeline.canvas.selected_id
         self.clip_combo.blockSignals(True); self.clip_combo.clear()
-        for i,clip in enumerate(self.audio_clips): self.clip_combo.addItem(f'{i+1} · {os.path.basename(clip["path"])}',clip['id'])
+        for i,clip in enumerate(self.audio_clips): self.clip_combo.addItem(f'{i+1} · {clip.get("display_name",os.path.basename(clip["path"]))}',clip['id'])
         index=self.clip_combo.findData(ident)
-        choose_first=bool(self.audio_clips) and self.selected_track_id is None
+        choose_first=bool(self.audio_clips) and self.selected_track_id is None and not self.audio_timeline.canvas.selected_effect_id
         self.clip_combo.setCurrentIndex(index if index>=0 else (0 if choose_first else -1)); self.clip_combo.blockSignals(False)
         if choose_first and index<0: self.audio_timeline.canvas.selected_id=self.audio_clips[0]['id']
         self.audio_timeline.canvas.resize_content()
@@ -675,7 +704,7 @@ class StudioFeatures:
             self.refresh_audio_fields(); self.audio_timeline.canvas.update()
 
     def select_audio_clip(self,ident):
-        self.audio_timeline.canvas.selected_id=ident
+        self.audio_timeline.canvas.selected_id=ident; self.audio_timeline.canvas.selected_effect_id=None
         clip=self.selected_clip()
         if clip:
             self.selected_track_id=clip.get('track'); self.inspector_caption.setText(os.path.basename(clip['path']))
@@ -710,7 +739,7 @@ class StudioFeatures:
         self.refresh_audio_fields(); self.invalidate()
 
     def clips_changed(self):
-        self.refresh_audio_combo(); self.refresh_audio_fields(); self.refresh_track_fields(); self.invalidate()
+        self.refresh_audio_combo(); self.refresh_audio_fields(); self.refresh_track_fields(); self.refresh_effect_combo(); self.refresh_effect_fields(); self.invalidate()
 
     def split_audio(self):
         if self.audio_timeline.canvas.split():
@@ -733,7 +762,7 @@ class StudioFeatures:
     def prepare_fx(self):
         if not self.info or not self.live_audio or self.loading_project: return
         cfg=self.config()
-        if not cfg.animation or not cfg.builtin_fx: self.live_audio.fx_path=None; return
+        if cfg.effect_clips is not None or not cfg.animation or not cfg.builtin_fx: self.live_audio.fx_path=None; return
         job=EffectsAudio(cfg,self.info,self)
         if job.key==self.fx_key or any(j.key==job.key for j in self.fx_jobs): job.deleteLater(); return
         self.fx_key=job.key; self.live_audio.fx_path=None; self.fx_jobs.append(job)
@@ -768,7 +797,7 @@ class StudioFeatures:
         self.commit_selection()
         path,_=QFileDialog.getSaveFileName(self,'حفظ المشروع',str(Path(self.video).with_suffix('.montage.json')),'Montage project (*.montage.json)')
         if path:
-            with open(path,'w',encoding='utf-8') as handle: json.dump({'version':3,'settings':dataclasses.asdict(self.config()),'assets':list(self.library.assets)},handle,ensure_ascii=False,indent=2)
+            with open(path,'w',encoding='utf-8') as handle: json.dump({'version':4,'settings':dataclasses.asdict(self.config()),'assets':list(self.library.assets)},handle,ensure_ascii=False,indent=2)
             self.status.setText('تم حفظ المشروع مع مسارات الصوت والتحديدات والقوالب.')
 
     def load_project(self):
@@ -783,6 +812,8 @@ class StudioFeatures:
                 replacement,_=QFileDialog.getOpenFileName(self,'اختر مكان الفيديو الجديد','','Video (*.mp4 *.mov *.mkv *.webm)')
                 if not replacement: return
                 cfg.video=replacement
+            for item in cfg.sound_effects:
+                if item.get('builtin') and not os.path.isfile(item['path']): item['path']=builtin_sound(item['builtin'])[0]
             validate(cfg,media_info(cfg.video))
             self.apply_project(cfg)
             for asset in data.get('assets',[]):
@@ -794,6 +825,8 @@ class StudioFeatures:
         self.pause_live(); self.loading_project=True
         try:
             self.choose_video(cfg.video)
+            self.effect_clips[:]=copy.deepcopy(cfg.effect_clips) if cfg.effect_clips is not None else self.legacy_effects(cfg)
+            self.audio_timeline.canvas.selected_effect_id=None
             self.trim_in.setValue(cfg.trim_start); self.trim_out.setValue(cfg.trim_end if cfg.trim_end is not None else self.info['duration'])
             self.freeze.setValue(cfg.freeze_time); self.motion_duration.setValue(cfg.orbit_seconds); self.angle.setValue(cfg.orbit_angle)
             self.direction.setCurrentIndex(self.direction.findData(cfg.rotation_direction)); self.animation.setChecked(cfg.animation)
@@ -809,13 +842,16 @@ class StudioFeatures:
             self.music_start.setValue(cfg.music_start); self.drop_enabled.setChecked(cfg.drop_in_song is not None); self.drop_time.setValue(cfg.drop_in_song or 0)
             self.music_volume.setValue(round(cfg.music_volume*100)); self.game_enabled.setChecked(cfg.game_audio); self.game_volume.setValue(round(cfg.game_volume*100))
             self.music_mute.setChecked(cfg.music_muted)
-            self.builtin_fx.setChecked(cfg.builtin_fx); self.fx_volume.setValue(round(cfg.fx_volume*100))
+            self.builtin_fx.setChecked(False); self.fx_volume.setValue(round(cfg.fx_volume*100))
             self.audio_clips.clear()
             self.audio_tracks.clear(); self.audio_tracks.extend(copy.deepcopy(cfg.audio_tracks))
             for item in cfg.sound_effects: self.fx_row(item['path'],item['time'],item['volume']*100,item)
+            if cfg.effect_clips is None and cfg.animation and cfg.builtin_fx:
+                path,title,duration=builtin_sound('freeze_mix'); old_plan=edit_plan(cfg,self.info)
+                self.fx_row(path,max(0,old_plan['ramp']-.1),cfg.fx_volume*100,item=dict(duration=duration,source_duration=duration,builtin='freeze_mix',display_name=title))
             if cfg.music: self.analyze(cfg.music)
             self.resolution.setCurrentIndex(self.resolution.findData(cfg.output_height)); self.fps.setCurrentIndex(self.fps.findData(cfg.output_fps)); self.quality.setCurrentIndex(self.quality.findData(cfg.quality))
-            self.selected_track_id=None; self.refresh_audio_combo(); self.refresh_audio_fields(); self.refresh_track_fields(); self.output_position=source_to_output(self.config(),self.info,cfg.freeze_time)
+            self.selected_track_id=None; self.refresh_effect_combo(); self.refresh_effect_fields(); self.refresh_audio_combo(); self.refresh_audio_fields(); self.refresh_track_fields(); self.output_position=source_to_output(self.config(),self.info,cfg.freeze_time)
             self.source_position=cfg.freeze_time; self.mode='live'; self.view.source=False
         finally: self.loading_project=False
         self.invalidate(); self.request_live(); self.prepare_fx()
@@ -840,14 +876,15 @@ class StudioFeatures:
         self.commit_selection()
         try:
             os.makedirs(CACHE_DIR,exist_ok=True)
-            path=os.path.join(CACHE_DIR,'session_v3.json'); temp=path+'.tmp'
-            data={'version':3,'settings':dataclasses.asdict(self.config()),'position':self.output_position,'assets':list(self.library.assets)}
+            path=os.path.join(CACHE_DIR,'session_v4.json'); temp=path+'.tmp'
+            data={'version':4,'settings':dataclasses.asdict(self.config()),'position':self.output_position,'assets':list(self.library.assets)}
             with open(temp,'w',encoding='utf-8') as handle: json.dump(data,handle,ensure_ascii=False)
             os.replace(temp,path)
         except OSError: pass
 
     def restore_session(self):
-        path=os.path.join(CACHE_DIR,'session_v3.json')
+        path=os.path.join(CACHE_DIR,'session_v4.json')
+        if not os.path.isfile(path): path=os.path.join(CACHE_DIR,'session_v3.json')
         if not os.path.isfile(path) or self.video: return
         try:
             with open(path,encoding='utf-8') as handle: data=json.load(handle)
@@ -858,3 +895,11 @@ class StudioFeatures:
                 if os.path.isfile(asset): self.library.add_file(asset)
             self.seek_output(data.get('position',0)); self.status.setText('تمت استعادة آخر جلسة تحرير.')
         except Exception: self.status.setText('افتح فيديو أو مشروعًا محفوظًا للبدء.')
+
+    def set_freeze(self,time):
+        if self.info: self.add_effect('freeze',source=time)
+
+    def remove_asset(self,path):
+        if self.busy: return
+        if self.library.remove_file(path):
+            self.removed_assets.add(path); self.status.setText('تمت الإزالة من الوسائط؛ المقاطع المستخدمة وملف الجهاز يبقوا محفوظين.')

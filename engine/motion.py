@@ -15,7 +15,7 @@ class Motion:
         self.background = cv2.resize(cv2.GaussianBlur(small, (0, 0), 10), (self.w, self.h))
         self.background = (self.background.astype(np.float32) * 0.4).astype(np.uint8)
 
-    def frame(self, k):
+    def frame(self, k, source_frame=None):
         # Reach the requested angle, then return smoothly to the source orientation.
         p = k / max(1, self.count - 1)
         if p < 0.85:
@@ -38,7 +38,8 @@ class Motion:
         elif style == 'focus':
             scale *= 1 - strength * .15 * math.sin(p * math.pi)
         matrix = cv2.getRotationMatrix2D((self.w / 2, self.h / 2), angle, scale)
-        original = apply_background(self.original, self.protected_mask, self.cfg, k / self.cfg.output_fps)
+        original = apply_background(self.original if source_frame is None else source_frame,
+                                    self.protected_mask, self.cfg, k / self.cfg.output_fps)
         frame = cv2.warpAffine(original, matrix, (self.w, self.h), flags=cv2.INTER_LINEAR)
         alpha = cv2.warpAffine(np.full((self.h, self.w), 255, np.uint8), matrix,
                                (self.w, self.h), flags=cv2.INTER_LINEAR).astype(np.float32)[..., None] / 255

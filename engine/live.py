@@ -6,11 +6,12 @@ import threading
 import cv2
 import numpy as np
 from PySide6.QtCore import QThread, Signal
-from .editing import timeline, dimensions
+from .editing import timeline, dimensions, source_frame_to_output
 from .hud import region_mask
 from .background import ProtectionTracker, polygon_mask, apply_background, enabled
 from .motion import Motion, finish
 from .templates import close_media
+from .effects import motion_config, backgrounds_at, timed_background, timed_visuals
 
 
 def edit_plan(cfg, info):
@@ -21,7 +22,17 @@ def edit_plan(cfg, info):
 def sample_output(cfg, info, time):
     plan = edit_plan(cfg, info)
     fps = cfg.output_fps
-    index = min(max(0, int(time*fps)), plan['total_frames']-1)
+    index = min(max(0, int(time*fps + 1e-7)), plan['total_frames']-1)
+    if cfg.effect_clips is not None:
+        segment = next(s for s in plan['segments'] if s['output_start'] <= index < s['output_end'])
+        k = index - segment['output_start']
+        frame = segment['source_start'] + k * segment['speed']
+        phase = 'motion' if segment['kind'] == 'freeze' else 'ramp' if segment['kind'] == 'slowmo' else 'video'
+        plan['active_segment'] = segment
+        plan['active_motion'] = segment['clip'] if phase == 'motion' else None
+        if phase == 'motion':
+            plan['motion'] = segment['output_end'] - segment['output_start']
+        return cfg.trim_start + frame / fps, phase, k if phase == 'motion' else 0, plan
     if not cfg.animation or index < plan['before']:
         frame, phase, k = index, 'video', 0
     elif index < plan['before']+plan['ramp_out']:
@@ -40,6 +51,8 @@ def sample_output(cfg, info, time):
 def source_to_output(cfg, info, source):
     plan = edit_plan(cfg, info)
     frame = max(0,(source-cfg.trim_start)*cfg.output_fps)
+    if cfg.effect_clips is not None:
+        return source_frame_to_output(plan, frame, cfg.output_fps)
     if not cfg.animation or frame <= plan['before']:
         return frame/cfg.output_fps
     if frame < plan['ff'] and plan['ramp_src']:
@@ -135,6 +148,17 @@ class LiveFrames(QThread):
         if cfg.remove_hud and cfg.hud_regions:
             mask = region_mask(frame.shape,cfg.hud_regions)
             frame = cv2.inpaint(frame,mask,max(1,round(h/360)),cv2.INPAINT_TELEA)
+        if cfg.effect_clips is not None:
+            mask = self.foreground(cfg, info, frame, source) if backgrounds_at(cfg, t) else None
+            prepared = timed_background(frame, mask, cfg, t)
+            if phase == 'motion':
+                clip = plan['active_motion']
+                key = (str(dataclasses.asdict(cfg)), str(clip.get('id')), (h, w))
+                if key != self.motion_key:
+                    self.motion = Motion(frame, motion_config(cfg, clip), plan['motion'])
+                    self.motion_key = key
+                prepared = self.motion.frame(k, source_frame=prepared)
+            return timed_visuals(prepared, cfg, t), source
         if phase == 'motion':
             key = (str(dataclasses.asdict(cfg)),(h,w))
             if key != self.motion_key:

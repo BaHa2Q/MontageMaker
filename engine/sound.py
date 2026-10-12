@@ -1,5 +1,8 @@
 """Sound design: riser, freeze boom, scan, orbit pad, whip; music low-passed during the freeze; game audio under it."""
 import numpy as np
+import os
+import tempfile
+from fractions import Fraction
 from scipy import signal
 from scipy.io import wavfile
 
@@ -24,7 +27,7 @@ def _read_wav(path):
 
 
 def make_soundtrack(total, t_ramp, t_freeze, t_resume, orbit_end, music_path, game_path, game_segments, out_path,
-                    music_gain=0.55, fx_gain=0.75, game_gain=0.6, custom_effects=None):
+                    music_gain=0.55, fx_gain=0.75, game_gain=0.6, custom_effects=None, legacy_treatment=True):
     N = int(total * SR) + SR
     L = np.zeros(N); R = np.zeros(N)
     rng = np.random.default_rng(3)
@@ -116,8 +119,8 @@ def make_soundtrack(total, t_ramp, t_freeze, t_resume, orbit_end, music_path, ga
         if len(mus) < M:
             mus = np.pad(mus, ((0, M - len(mus)), (0, 0)))
         nper, hop = 2048, 512
-        out_m = np.zeros_like(mus)
-        for ch in range(2):
+        out_m = np.zeros_like(mus) if legacy_treatment else mus
+        for ch in range(2) if legacy_treatment else ():
             f, tt, Z = signal.stft(mus[:, ch], SR, nperseg=nper, noverlap=nper - hop)
             fc = np.full(len(tt), 20000.0)
             a1 = t_freeze - 0.02
@@ -129,26 +132,36 @@ def make_soundtrack(total, t_ramp, t_freeze, t_resume, orbit_end, music_path, ga
             g = np.ones(len(tt)); g[(tt >= a1) & (tt < t_resume - 0.4)] = 0.85
             y = signal.istft(Z * (1.0 / np.sqrt(1 + (f[:, None] / fc[None, :]) ** 8)) * g[None, :], SR, nperseg=nper, noverlap=nper - hop)[1]
             out_m[:len(y[:M]), ch] = y[:M]
-        fo = np.clip((M - np.arange(M)) / (1.0 * SR), 0, 1)
+        fo = np.clip((M - np.arange(M)) / (1.0 * SR), 0, 1) if legacy_treatment else np.ones(M)
         mix = mix + out_m * fo[:, None] * music_gain
 
     # game audio pieces (normal speed parts of the clip)
     if game_path:
         g = _read_wav(game_path)
-        for out_t0, src_t0, dur, fin, fout in game_segments:
-            a, b = int(src_t0 * SR), int((src_t0 + dur) * SR)
+        for piece in game_segments:
+            out_t0, src_t0, dur, fin, fout = piece[:5]
+            speed = piece[5] if len(piece)>5 else 1.0
+            a, b = round(src_t0 * SR), round((src_t0 + dur*speed) * SR)
             seg = g[a:b].copy()
             if not len(seg):
                 continue
+            target=round(dur*SR)
+            if abs(speed-1)>1e-6:
+                ratio=Fraction(1/float(speed)).limit_denominator(1000)
+                seg=signal.resample_poly(seg,ratio.numerator,ratio.denominator,axis=0)
+            seg=seg[:target]
+            if len(seg)<target: seg=np.pad(seg,((0,target-len(seg)),(0,0)))
             n = len(seg); tt = np.arange(n) / SR
-            e = np.clip(tt / max(fin, 1e-3), 0, 1) * np.clip((dur - tt) / max(fout, 1e-3), 0, 1)
+            e = np.ones(n)
+            if fin>0: e *= np.clip(tt/fin,0,1)
+            if fout>0: e *= np.clip((dur-tt)/fout,0,1)
             o = int(out_t0 * SR)
             seg = seg[: max(0, M - o)]
             mix[o:o + len(seg)] += seg * e[:len(seg), None] * game_gain
 
     # Imported clips use their own fades; the automatic tail is for built-in audio only.
     end_fade = np.clip((M - np.arange(M)) / (0.7 * SR), 0, 1)
-    mix = mix * end_fade[:, None]
+    if legacy_treatment: mix = mix * end_fade[:, None]
     for effect in custom_effects or []:
         path, start, volume = effect[:3]
         fade_in, fade_out = effect[3:5] if len(effect) >= 5 else (0, 0)
@@ -169,3 +182,51 @@ def make_soundtrack(total, t_ramp, t_freeze, t_resume, orbit_end, music_path, ga
     mix = np.tanh(mix * 1.1) / np.tanh(1.1)
     mix /= max(1.0, np.abs(mix).max() / 0.95)
     wavfile.write(out_path, SR, (mix * 32767).astype(np.int16))
+
+
+BUILTIN_SOUNDS = [
+    ('freeze_mix','تجميد كامل',6.0),('impact','ضربة التجميد',2.2),
+    ('whoosh','مرور سريع',.65),('riser','تصاعد',1.3),
+    ('rewind','رجعة',.85),('orbit_pad','جو الدوران',3.0),
+    ('scan','مسح إلكتروني',1.1),('glitch','تقطيع إلكتروني',.55),
+]
+
+
+def builtin_sound(key):
+    """Cached ordinary WAV assets; adding one never changes video effects."""
+    from .util import CACHE_DIR
+    item=next((item for item in BUILTIN_SOUNDS if item[0]==key),None)
+    if item is None: raise ValueError('Unknown built-in sound.')
+    _,title,duration=item
+    directory=os.path.join(CACHE_DIR,'sounds'); os.makedirs(directory,exist_ok=True)
+    path=os.path.join(directory,'studio4_'+key+'.wav')
+    if os.path.isfile(path): return path,title,duration
+    fd,temp=tempfile.mkstemp(suffix='.wav',dir=directory); os.close(fd)
+    try:
+        if key=='freeze_mix':
+            make_soundtrack(duration,0,1,4,2.7,None,None,[],temp,fx_gain=.8)
+        else:
+            t=np.arange(round(duration*SR))/SR; rng=np.random.default_rng(41)
+            noise=rng.normal(0,.25,len(t))
+            if key=='impact':
+                y=np.sin(2*np.pi*np.cumsum(35+80*np.exp(-t*8))/SR)*np.exp(-t/ .45)+noise*np.exp(-t/.025)
+            elif key in ('whoosh','riser','rewind'):
+                low=signal.sosfilt(signal.butter(2,3800,'low',fs=SR,output='sos'),noise)
+                env=np.sin(np.pi*t/duration)**1.5
+                if key=='riser': env=(t/duration)**2
+                f=150+2200*(t/duration if key!='rewind' else 1-t/duration)
+                y=(low+np.sin(2*np.pi*np.cumsum(f)/SR)*.09)*env
+            elif key=='orbit_pad':
+                y=sum(np.sin(2*np.pi*f*t)*a for f,a in ((55,.25),(82.41,.2),(110,.13),(164.8,.06)))*np.sin(np.pi*t/duration)**.7
+            elif key=='scan':
+                y=(np.sin(2*np.pi*np.cumsum(400+1500*t/duration)/SR)*.4+noise*.2)*( .6+.4*np.sin(2*np.pi*28*t))
+            else:
+                y=(np.sign(np.sin(2*np.pi*700*t))*.25+noise)*((np.floor(t*45)%3)!=1)
+            y*=np.clip(t/.012,0,1)*np.clip((duration-t)/.08,0,1)
+            y=y/max(np.max(np.abs(y)),1e-6)*.72
+            stereo=np.stack([y,y],axis=1)
+            wavfile.write(temp,SR,(stereo*32767).astype(np.int16))
+        os.replace(temp,path)
+    finally:
+        if os.path.exists(temp): os.unlink(temp)
+    return path,title,duration

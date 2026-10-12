@@ -5,6 +5,7 @@ from PySide6.QtGui import QIcon,QPixmap,QPainter,QColor,QPen,QPainterPath,QDrag,
 from PySide6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QToolButton,QLabel,QPushButton,
     QLineEdit,QListWidget,QListWidgetItem,QStackedWidget,QScrollArea,QGridLayout,QMenu,QButtonGroup)
 from engine.templates import MOTION_TEMPLATES,BACKGROUND_TEMPLATES
+from engine.sound import BUILTIN_SOUNDS
 
 
 def icon_for(key):
@@ -28,6 +29,7 @@ def icon_for(key):
 
 class AssetList(QListWidget):
     used=Signal(str)
+    removed=Signal(str)
 
     def __init__(self):
         super().__init__(); self.setViewMode(QListWidget.IconMode); self.setResizeMode(QListWidget.Adjust)
@@ -45,12 +47,19 @@ class AssetList(QListWidget):
         item=self.itemAt(pos)
         if not item: return
         kind=item.data(Qt.UserRole+1)
-        menu=QMenu(self); action=menu.addAction('فتح الفيديو كمصدر' if kind=='video' else 'استخدام كخلفية' if kind=='image' else 'إضافة الصوت للمسار'); chosen=menu.exec(self.mapToGlobal(pos))
+        menu=QMenu(self); action=menu.addAction('فتح الفيديو كمصدر' if kind=='video' else 'استخدام كخلفية' if kind=='image' else 'إضافة الصوت للمسار')
+        menu.addSeparator(); remove=menu.addAction('إزالة من الوسائط'); chosen=menu.exec(self.mapToGlobal(pos))
         if chosen==action: self.used.emit(item.data(Qt.UserRole))
+        elif chosen==remove: self.removed.emit(item.data(Qt.UserRole))
+
+    def keyPressEvent(self,event):
+        if event.key() in (Qt.Key_Delete,Qt.Key_Backspace) and self.currentItem():
+            self.removed.emit(self.currentItem().data(Qt.UserRole)); event.accept()
+        else: super().keyPressEvent(event)
 
 
 class Library(QWidget):
-    imported=Signal(); used=Signal(str); motion=Signal(str); background=Signal(str,str); page=Signal(str)
+    imported=Signal(); used=Signal(str); removed=Signal(str); motion=Signal(str); background=Signal(str,str); page=Signal(str); sound=Signal(str)
 
     def __init__(self):
         super().__init__(); self.setObjectName('library'); self.assets={}
@@ -77,10 +86,16 @@ class Library(QWidget):
             btn.clicked.connect(lambda checked=False,k=key,c=color:self.background.emit(k,c)); self.background_group.addButton(btn); self.background_buttons[key]=btn; grid.addWidget(btn,i//2,i%2)
         self.background_buttons['none'].setChecked(True); grid.setRowStretch(7,1); self.stack.addWidget(self.scroll(bg))
         self.audio_page,self.audio_list,_=self.media_panel('أصواتك','استيراد أصوات'); self.stack.addWidget(self.audio_page)
+        sound_panel=QWidget(); sound_grid=QGridLayout(sound_panel); sound_grid.setContentsMargins(0,0,0,0)
+        for i,(key,title,duration) in enumerate(BUILTIN_SOUNDS):
+            btn=QPushButton('♫ '+title); btn.setMinimumHeight(36); btn.setToolTip('إضافة مقطع صوتي مستقل عند المؤشر')
+            btn.clicked.connect(lambda checked=False,k=key:self.sound.emit(k)); sound_grid.addWidget(btn,i//2,i%2)
+        self.audio_page.layout().insertWidget(2,sound_panel)
         for title,desc in [('تحديد العنصر','اختَر «حماية عنصر» فوق شاشة الفيديو. عجلة الماوس للتكبير، واسحب أي نقطة لتصحيح الحدود. رسمك يثبت تلقائيًا عند الانتقال.'),('التصدير','شاهد التعديل مباشرة ثم اختَر جودة الفيديو من الخصائص على اليمين.')]:
             panel=QWidget(); box=QVBoxLayout(panel); heading=QLabel(title); heading.setObjectName('section'); box.addWidget(heading); text=QLabel(desc); text.setWordWrap(True); box.addWidget(text); box.addStretch(); self.stack.addWidget(panel)
         self.nav_buttons['media'].setChecked(True)
         self.list.used.connect(self.used); self.audio_list.used.connect(self.used)
+        self.list.removed.connect(self.removed); self.audio_list.removed.connect(self.removed)
 
     def scroll(self,widget):
         scroll=QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(widget); return scroll
@@ -95,7 +110,7 @@ class Library(QWidget):
         search=QLineEdit(); search.setPlaceholderText('بحث في ملفاتك…'); box.addWidget(search)
         items=AssetList(); box.addWidget(items,1)
         search.textChanged.connect(lambda value:[items.item(i).setHidden(value.casefold() not in items.item(i).text().casefold()) for i in range(items.count())])
-        hint=QLabel('دبل كليك للإضافة، أو اسحب الصوت إلى المسار.'); hint.setWordWrap(True); hint.setObjectName('muted'); box.addWidget(hint)
+        hint=QLabel('دبل كليك للإضافة، أو اسحب الصوت للمسار. Delete يزيل العنصر من المكتبة فقط.'); hint.setWordWrap(True); hint.setObjectName('muted'); box.addWidget(hint)
         return panel,items,search
 
     def add_file(self,path,kind=None):
@@ -128,3 +143,11 @@ class Library(QWidget):
             if item:
                 if icon: item.setIcon(icon)
                 item.setText(f'{os.path.basename(path)}\n{int(data["duration"]//60):02}:{int(data["duration"]%60):02}')
+
+    def remove_file(self,path):
+        asset=self.assets.pop(path,None)
+        if not asset: return False
+        for items,key in ((self.list,'item'),(self.audio_list,'audio_item')):
+            item=asset.get(key)
+            if item is not None: items.takeItem(items.row(item))
+        return True

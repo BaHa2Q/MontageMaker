@@ -2,6 +2,8 @@
 import hashlib
 import os
 import tempfile
+import time as clock
+from dataclasses import dataclass
 from PySide6.QtCore import QObject, QThread, Signal, QUrl
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from engine.live import edit_plan, sample_output
@@ -37,9 +39,40 @@ class EffectsAudio(QThread):
         except Exception as ex: self.failed.emit(str(ex))
 
 
+@dataclass
+class _VoiceTransport:
+    """Requested transport, independent of Qt's asynchronous loading state."""
+    playing: bool = False
+    generation: int = -1
+    source: float | None = None
+    timeline: float | None = None
+    synced_at: float = 0.0
+    rate: float = 1.0
+    pending_seek: bool = False
+    volume: float | None = None
+
+
 class LiveAudio(QObject):
     def __init__(self,parent):
         super().__init__(parent); self.players={}; self.master=.65; self.fx_path=None; self.fx_offset=0; self.fx_duration=0
+        self.transports={}; self.seek_generation=0; self.timeline_position=None
+
+    def discontinuity(self):
+        """Call after a seek or a change to the edit's source-time mapping."""
+        self.seek_generation+=1
+
+    def media_ready(self,ident,player,status):
+        entry=self.players.get(ident); transport=self.transports.get(ident)
+        if not entry or entry[0] is not player or not transport or not transport.pending_seek:
+            return
+        if status not in (QMediaPlayer.LoadedMedia,QMediaPlayer.BufferedMedia):
+            return
+        # Loading can complete several ticks after play was requested. Reapply the
+        # latest desired offset once, instead of seeking on every loading tick.
+        transport.pending_seek=False
+        if transport.playing and transport.source is not None:
+            source=transport.source+max(0,clock.monotonic()-transport.synced_at)*transport.rate
+            player.setPosition(round(max(0,source)*1000))
 
     def voice(self,ident,path):
         entry=self.players.get(ident)
@@ -47,32 +80,65 @@ class LiveAudio(QObject):
             if entry:
                 entry[0].stop(); entry[0].deleteLater(); entry[1].deleteLater()
             player=QMediaPlayer(self); audio=QAudioOutput(self); player.setAudioOutput(audio)
-            player.setSource(QUrl.fromLocalFile(path))
             entry=(player,audio,path); self.players[ident]=entry
+            self.transports[ident]=_VoiceTransport()
+            player.mediaStatusChanged.connect(lambda status,i=ident,p=player:self.media_ready(i,p,status))
+            if ident=='game' and hasattr(player,'setPitchCompensation'):
+                player.setPitchCompensation(False)
+            player.setSource(QUrl.fromLocalFile(path))
         return entry
 
-    def sync_voice(self,ident,path,source,volume,playing,active=True):
+    def sync_voice(self,ident,path,source,volume,playing,active=True,rate=1.0):
         if not path: return
         if not playing or not active or source<0:
             entry=self.players.get(ident)
-            if entry: entry[0].pause()
+            transport=self.transports.get(ident)
+            if entry and transport and transport.playing:
+                entry[0].pause(); transport.playing=False; transport.pending_seek=False
             return
         player,audio,_=self.voice(ident,path)
-        audio.setVolume(min(1,max(0,volume*self.master)))
-        if abs(player.position()/1000-source)>.14 or player.playbackState()!=QMediaPlayer.PlayingState:
+        transport=self.transports[ident]; now=clock.monotonic()
+        gain=min(1,max(0,volume*self.master))
+        if transport.volume!=gain:
+            audio.setVolume(gain); transport.volume=gain
+        rate=max(.05,min(4,float(rate)))
+        changed=transport.generation!=self.seek_generation
+        if transport.source is not None and transport.timeline is not None and self.timeline_position is not None:
+            expected=(self.timeline_position-transport.timeline)*transport.rate
+            # Compare requested timeline positions, not sparse backend position
+            # updates. The latter can lag while streaming perfectly normally.
+            changed=changed or abs((source-transport.source)-expected)>.08
+        starting=not transport.playing
+        if starting or changed:
             player.setPosition(round(source*1000))
-        player.setPlaybackRate(1)
-        player.play()
+            transport.pending_seek=player.mediaStatus() in (QMediaPlayer.NoMedia,QMediaPlayer.LoadingMedia)
+        if starting or abs(transport.rate-rate)>.0001:
+            player.setPlaybackRate(rate)
+        transport.source=float(source); transport.timeline=self.timeline_position
+        transport.synced_at=now; transport.rate=rate; transport.generation=self.seek_generation
+        if starting:
+            transport.playing=True; player.play()
 
     def sync(self,cfg,info,time,source,original,playing):
         if not cfg.video: return
+        self.timeline_position=float(time)
         plan=edit_plan(cfg,info)
-        phase='video' if original else sample_output(cfg,info,time)[1]
+        sampled=None if original else sample_output(cfg,info,time)
+        phase='video' if original else sampled[1]
+        game_rate=1.0; game_active=phase=='video'
+        if not original:
+            source=sampled[0]
+            segment=sampled[3].get('active_segment')
+            if segment and segment.get('kind') in ('video','slowmo'):
+                game_rate=segment.get('speed',1)
+                game_active=True
+                # Audio uses continuous output time, without frame quantization.
+                output_frame=max(segment['output_start'],min(segment['output_end'],time*cfg.output_fps))
+                source=cfg.trim_start+(segment['source_start']+(output_frame-segment['output_start'])*game_rate)/cfg.output_fps
         active={'game'}
-        self.sync_voice('game',cfg.video,source,cfg.game_volume,playing,cfg.game_audio and info['audio'] and phase=='video')
+        self.sync_voice('game',cfg.video,source,cfg.game_volume,playing,cfg.game_audio and info['audio'] and game_active,game_rate)
         if original:
-            for ident,(player,_,_) in self.players.items():
-                if ident!='game': player.pause()
+            self.pause_missing(active)
             return
         if cfg.music:
             active.add('music')
@@ -92,11 +158,17 @@ class LiveAudio(QObject):
             active.add('builtin')
             self.sync_voice('builtin',self.fx_path,time-self.fx_offset,cfg.fx_volume,playing,
                             cfg.builtin_fx and cfg.animation and self.fx_offset<=time<self.fx_offset+self.fx_duration)
+        self.pause_missing(active)
+
+    def pause_missing(self,active):
         for ident,(player,_,_) in self.players.items():
-            if ident not in active: player.pause()
+            transport=self.transports[ident]
+            if ident not in active and transport.playing:
+                player.pause(); transport.playing=False; transport.pending_seek=False
 
     def pause(self):
-        for player,_,_ in self.players.values(): player.pause()
+        self.pause_missing(set())
 
     def close(self):
         for player,_,_ in self.players.values(): player.stop(); player.setSource(QUrl())
+        for transport in self.transports.values(): transport.playing=False; transport.pending_seek=False
