@@ -26,7 +26,10 @@ $name = "MontageMaker-Setup-$version.exe"
 Copy-Item dist\MontageMaker-Setup.exe "dist\$name" -Force
 
 # Use the GitHub login Git already stores for this machine.
-$credential = 'protocol=https', 'host=github.com', '' | git credential fill
+# No BOM: Git rejects input whose first line starts with one.
+$OutputEncoding = New-Object Text.UTF8Encoding $false
+$credential = "protocol=https`nhost=github.com`n`n" | git credential fill
+if (-not $credential) { throw 'No saved GitHub login. Run: git push once and sign in.' }
 $token = ($credential | Where-Object { $_ -like 'password=*' }) -replace '^password=', ''
 $headers = @{ Authorization = "Bearer $token"; Accept = 'application/vnd.github+json'; 'User-Agent' = 'MontageMaker' }
 $body = @{ tag_name = "v$version"; target_commitish = (git rev-parse HEAD); name = "Montage Maker $version"; body = $Notes } | ConvertTo-Json
