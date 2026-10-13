@@ -1,4 +1,4 @@
-"""Startup update check: download the newer installer, verify it, run it."""
+﻿"""Startup update check: download the newer installer, verify it, run it."""
 import hashlib
 import json
 import os
@@ -6,7 +6,7 @@ import tempfile
 import urllib.request
 from PySide6.QtCore import QThread, Signal
 
-VERSION = '4.2'
+VERSION = '4.3'
 UPDATE_URL = 'https://mizan.169-58-133-134.sslip.io/montagemaker/latest.json'
 
 
