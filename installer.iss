@@ -4,6 +4,9 @@
 #ifndef SetupOutput
   #define SetupOutput "dist"
 #endif
+#ifndef AppVer
+  #define AppVer "4.2"
+#endif
 #ifdef TestBuild
   #define InstallerId "{1965430A-A768-49E5-9F30-0E4415F9B231}"
   #define InstallerName "Montage Maker Studio QA"
@@ -15,7 +18,7 @@
 [Setup]
 AppId={{#InstallerId}
 AppName={#InstallerName}
-AppVersion=4.1
+AppVersion={#AppVer}
 AppPublisher=Montage Maker Studio
 DefaultDirName={autopf}\Montage Maker Studio
 DefaultGroupName=Montage Maker Studio 4
@@ -53,3 +56,5 @@ Name: "{group}\Uninstall Montage Maker Studio"; Filename: "{uninstallexe}"
 
 [Run]
 Filename: "{app}\MontageMaker.exe"; Description: "Open Montage Maker Studio / فتح البرنامج"; Flags: nowait postinstall skipifsilent
+; Silent updates reopen the editor as the user who started the update.
+Filename: "{app}\MontageMaker.exe"; Flags: nowait runasoriginaluser; Check: WizardSilent

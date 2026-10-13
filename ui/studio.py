@@ -61,7 +61,7 @@ class StudioFeatures(VideoEditor,EffectEditor):
         self.proxy_jobs=[]
         self.background_color='#73e0bd'; self.loading_project=False
         super().__init__()
-        self.setWindowTitle('Montage Maker Studio 4.1')
+        from .updater import VERSION; self.setWindowTitle('Montage Maker Studio '+VERSION)
         self.resize(1530,1010); self.setMinimumSize(1100,820)
         self.player.stop(); self.player.setVideoSink(None)
         self.live_frames=LiveFrames(self)
@@ -90,6 +90,9 @@ class StudioFeatures(VideoEditor,EffectEditor):
         self.last_tick=time.monotonic()
         if '--self-test' not in sys.argv and not os.environ.get('MONTAGEMAKER_TESTING'):
             QTimer.singleShot(0,self.restore_session)
+        self.update_jobs=[]
+        if getattr(sys,'frozen',False) and not os.environ.get('MONTAGEMAKER_TESTING'):
+            QTimer.singleShot(1500,self.check_update)
 
 
 
@@ -893,7 +896,7 @@ class StudioFeatures(VideoEditor,EffectEditor):
         if self.worker and self.worker.isRunning():
             super().closeEvent(event); return
         for job in self.proxy_jobs: job.cancel.set()
-        jobs=list(self.analysis_jobs)+list(self.fx_jobs)+list(self.proxy_jobs)
+        jobs=list(self.analysis_jobs)+list(self.fx_jobs)+list(self.proxy_jobs)+list(getattr(self,'update_jobs',[]))
         if jobs:
             event.ignore(); self.status.setText('جاري إغلاق ملفات الصوت…'); QTimer.singleShot(200,self.close); return
         if self.live_frames:
@@ -928,6 +931,29 @@ class StudioFeatures(VideoEditor,EffectEditor):
                 if os.path.isfile(asset): self.library.add_file(asset)
             self.seek_output(data.get('position',0)); self.status.setText('تمت استعادة آخر جلسة تحرير.')
         except Exception: self.status.setText('افتح فيديو أو مشروعًا محفوظًا للبدء.')
+
+    def check_update(self):
+        from .updater import UpdateCheck
+        job=UpdateCheck(self); self.update_jobs.append(job); job.found.connect(self.offer_update)
+        job.finished.connect(lambda j=job:self.update_jobs.remove(j)); job.start()
+
+    def offer_update(self,data):
+        from PySide6.QtWidgets import QMessageBox
+        from .updater import UpdateDownload,VERSION
+        notes=data.get('notes','')
+        answer=QMessageBox.question(self,'تحديث جديد',f'الإصدار {data["version"]} متوفر (عندك {VERSION}).\n{notes}\n\nتحدّث الآن؟ البرنامج رح يسكّر ويفتح لحاله بعد التحديث.')
+        if answer!=QMessageBox.Yes: return
+        self.save_session()
+        job=UpdateDownload(data,self); self.update_jobs.append(job)
+        job.progress.connect(lambda value:(self.progress.setValue(round(value*1000)),self.status.setText(f'جاري تنزيل التحديث… {value*100:.0f}%')))
+        job.done.connect(self.install_update); job.failed.connect(lambda message:self.status.setText('تعذّر التحديث: '+message))
+        job.finished.connect(lambda j=job:self.update_jobs.remove(j)); job.start()
+
+    def install_update(self,path):
+        # ShellExecute shows the UAC prompt the admin installer needs.
+        os.startfile(path,arguments='/SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS')
+        from PySide6.QtWidgets import QApplication
+        QApplication.quit()
 
     def set_freeze(self,time):
         if self.info: self.add_effect('freeze',source=time)
