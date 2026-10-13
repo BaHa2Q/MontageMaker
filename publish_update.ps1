@@ -26,9 +26,11 @@ $name = "MontageMaker-Setup-$version.exe"
 Copy-Item dist\MontageMaker-Setup.exe "dist\$name" -Force
 
 # Use the GitHub login Git already stores for this machine.
-# No BOM: Git rejects input whose first line starts with one.
-$OutputEncoding = New-Object Text.UTF8Encoding $false
-$credential = "protocol=https`nhost=github.com`n`n" | git credential fill
+# PowerShell 5 mangles text piped into native programs, so feed Git from a plain LF file.
+$query = Join-Path $env:TEMP 'mm-credential.txt'
+[IO.File]::WriteAllText($query, "protocol=https`nhost=github.com`n`n")
+$credential = cmd /c "git credential fill < `"$query`""
+Remove-Item $query
 if (-not $credential) { throw 'No saved GitHub login. Run: git push once and sign in.' }
 $token = ($credential | Where-Object { $_ -like 'password=*' }) -replace '^password=', ''
 $headers = @{ Authorization = "Bearer $token"; Accept = 'application/vnd.github+json'; 'User-Agent' = 'MontageMaker' }
