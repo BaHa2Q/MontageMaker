@@ -262,6 +262,11 @@ class TrackCanvas(TimelineOperations,QWidget):
         group=getattr(self,'drag_group',[])
         if not group: return
         delta=max(delta,-min(span[0] for _,_,span in group))
+        moving={old['id'] for _,old,_ in group}
+        for kind,old,span in group:
+            if kind in ('video','audio'):
+                left,right=self.free_gap(kind,old,*span,exclude=moving)
+                delta=min(max(delta,left-span[0]),right-span[0]-span[1])
         for kind,old,span in group:
             clip=self.item(kind,old['id'])
             if clip is None or self.item_locked(kind,clip): continue
@@ -283,13 +288,15 @@ class TrackCanvas(TimelineOperations,QWidget):
             # A ramped clip can only be shortened; extending would invent speeds outside its curve.
             if edge=='left':
                 delta=max(0,min(delta,duration-.05)); clip.update(sub_clip(old,delta/duration,1)); clip['time']=old.get('time',0)+delta
+            # Shortening never collides with a neighbour, so ramped clips need no gap check.
             else: clip.update(sub_clip(old,0,max(.05,min(duration,duration+delta))/duration))
         elif edge=='left':
             delta=max(-old.get('time',0),-old['source_in']/speed if speed else -float('inf'),min(delta,duration-.05))
+            delta=max(delta,self.free_gap('video',old,start,duration)[0]-start)
             clip['time']=old.get('time',0)+delta; clip['source_in']=old['source_in']+delta*speed; clip['duration']=old['duration']-delta
         else:
             available=(self.video_cfg[1]['duration']-old['source_in'])/speed if self.video_cfg and speed else float('inf')
-            clip['duration']=max(.05,min(duration+delta,available))
+            clip['duration']=max(.05,min(duration+delta,available,self.free_gap('video',old,start,duration)[1]-start))
         self.changed.emit(); self.update()
 
     def resize_content(self):
@@ -523,10 +530,12 @@ class TrackCanvas(TimelineOperations,QWidget):
         elif edge=='left':
             rate=max(.01,old.get('rate',1))
             delta=max(-old['source_in']/rate,-old['time'],min(delta,old['duration']-.05))
+            delta=max(delta,self.free_gap('audio',old,old['time'],old['duration'])[0]-old['time'])
             clip['time']=old['time']+delta; clip['source_in']=old['source_in']+delta*rate; clip['duration']=old['duration']-delta
         else:
             rate=max(.01,old.get('rate',1))
-            clip['duration']=max(.05,min(old['duration']+delta,((old.get('source_duration') or old['source_in']+old['duration']*rate)-old['source_in'])/rate))
+            clip['duration']=max(.05,min(old['duration']+delta,((old.get('source_duration') or old['source_in']+old['duration']*rate)-old['source_in'])/rate,
+                                         self.free_gap('audio',old,old['time'],old['duration'])[1]-old['time']))
         self.changed.emit(); self.update()
 
     def mouseReleaseEvent(self,event):

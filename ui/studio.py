@@ -765,7 +765,9 @@ class StudioFeatures(VideoEditor,EffectEditor):
         length=clip.get('source_duration') or clip['source_in']+clip['duration']
         start=min(max(0,self.clip_in.value()),max(0,length-.05))
         end=min(length,max(start+.05,self.clip_out.value()))
-        clip.update(time=self.clip_time.value(),source_in=start,duration=(end-start)/clip.get('rate',1),
+        left,right=self.audio_timeline.canvas.free_gap('audio',clip,clip['time'],clip['duration'])
+        duration=max(.05,min((end-start)/clip.get('rate',1),right-left))
+        clip.update(time=min(max(self.clip_time.value(),left),right-duration),source_in=start,duration=duration,
                     volume=self.clip_volume.value()/100,fade_in=self.clip_fade_in.value(),fade_out=self.clip_fade_out.value(),
                     muted=self.clip_mute.isChecked(),locked=self.clip_lock.isChecked())
         self.refresh_audio_fields(); self.invalidate()

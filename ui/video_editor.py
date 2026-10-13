@@ -88,7 +88,9 @@ class VideoEditor:
             self.pause_live(); self.live_audio.discontinuity(); self.refresh_video_fields(); self.clips_changed(); return
         speed=clip.get('speed',1); source=self.video_in.value()
         maximum=(self.info['duration']-source)/speed if speed else 86400
-        clip.update(time=self.video_time.value(),source_in=source,duration=max(.05,min(self.video_length.value(),maximum)),muted=self.video_mute.isChecked(),locked=self.video_lock.isChecked())
+        left,right=self.audio_timeline.canvas.free_gap('video',clip,clip.get('time',0),clip['duration'])
+        duration=max(.05,min(self.video_length.value(),maximum,right-left))
+        clip.update(time=min(max(self.video_time.value(),left),right-duration),source_in=source,duration=duration,muted=self.video_mute.isChecked(),locked=self.video_lock.isChecked())
         self.pause_live(); self.live_audio.discontinuity(); self.refresh_video_fields(); self.invalidate()
 
     def change_video_speed(self,clip,speed):
@@ -99,6 +101,11 @@ class VideoEditor:
             if audio.get('source_audio') and audio['path']==self.video and not audio.get('locked') and start-.001<=audio['time'] and audio['time']+audio['duration']<=end+.001:
                 audio['time']=start+(audio['time']-start)*ratio; audio['duration']*=ratio; audio['rate']=audio.get('rate',1)/ratio
         clip['speed']=speed; clip['duration']=max(.05,clip['duration']*ratio)
+        # A longer clip pushes the clips after it (and their source audio) instead of covering them.
+        later=[c for c in self.video_clips if c is not clip and c.get('time',0)>=end-1e-6]
+        push=start+clip['duration']-min((c.get('time',0) for c in later),default=float('inf'))
+        if push>0:
+            for item in later+[a for a in self.audio_clips if a.get('source_audio') and a['time']>=end-1e-6]: item['time']+=push
 
     def fill_ramp_table(self,clip):
         points=ramp_points(clip) or [[0,clip.get('speed',1)],[1,clip.get('speed',1)]]

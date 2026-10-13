@@ -49,6 +49,15 @@ class TimelineOperations:
         clips=list(reversed(self.video_clips or []))
         return next((clip for clip in clips if self.video_rect(clip).contains(pos)),None) or next((clip for clip in clips if self.video_rect(clip).adjusted(-4,0,4,0).contains(pos)),None)
 
+    def free_gap(self,kind,clip,start,duration,exclude=()):
+        """Space around a video/audio clip on its own lane: neighbours act as walls."""
+        lane=self.item_list(kind) if kind=='video' else [c for c in self.clips if c.get('track')==clip.get('track')]
+        spans=[self.video_span(c) if kind=='video' else (c['time'],c['duration']) for c in lane
+               if c.get('id')!=clip.get('id') and c.get('id') not in exclude]
+        left=max([s+d for s,d in spans if s+d<=start+1e-6],default=0.0)
+        right=min([s for s,d in spans if s>=start+duration-1e-6],default=float('inf'))
+        return left,right
+
     def is_selected(self,kind,ident):
         return (kind,ident) in self.selection
 
