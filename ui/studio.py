@@ -939,21 +939,13 @@ class StudioFeatures(VideoEditor,EffectEditor):
 
     def offer_update(self,data):
         from PySide6.QtWidgets import QMessageBox
-        from .updater import UpdateDownload,VERSION
+        from .updater import start_update,VERSION
         notes=data.get('notes','')
-        answer=QMessageBox.question(self,'تحديث جديد',f'الإصدار {data["version"]} متوفر (عندك {VERSION}).\n{notes}\n\nتحدّث الآن؟ البرنامج رح يسكّر ويفتح لحاله بعد التحديث.')
+        answer=QMessageBox.question(self,'تحديث جديد',f'الإصدار {data["version"]} متوفر (عندك {VERSION}).\n{notes}\n\nتحدّث الآن؟ البرنامج رح يسكّر، يتنزّل التحديث ويتنصّب، وبعدين يفتح لحاله.')
         if answer!=QMessageBox.Yes: return
-        self.save_session()
-        job=UpdateDownload(data,self); self.update_jobs.append(job)
-        job.progress.connect(lambda value:(self.progress.setValue(round(value*1000)),self.status.setText(f'جاري تنزيل التحديث… {value*100:.0f}%')))
-        job.done.connect(self.install_update); job.failed.connect(lambda message:self.status.setText('تعذّر التحديث: '+message))
-        job.finished.connect(lambda j=job:self.update_jobs.remove(j)); job.start()
-
-    def install_update(self,path):
-        # ShellExecute shows the UAC prompt the admin installer needs.
-        os.startfile(path,arguments='/SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS')
-        from PySide6.QtWidgets import QApplication
-        QApplication.quit()
+        try: start_update(data)
+        except OSError as ex: self.status.setText('تعذّر بدء التحديث: '+str(ex)); return
+        self.close()  # closeEvent saves the session before exiting.
 
     def set_freeze(self,time):
         if self.info: self.add_effect('freeze',source=time)
