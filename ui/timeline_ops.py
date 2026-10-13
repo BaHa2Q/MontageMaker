@@ -136,9 +136,8 @@ class TimelineOperations:
                 right['source_in']=clip.get('source_in',0)+left*clip.get('rate',1); right['duration']=duration-left
                 right['fade_in']=0; clip['fade_out']=0; clip['duration']=left
             elif kind=='video':
-                source_left=left*clip.get('speed',1)
-                right['source_in']=clip['source_in']+source_left; right['duration']=duration-left
-                clip['duration']=left
+                from engine.video_edits import sub_clip
+                u=left/duration; right.update(sub_clip(clip,u,1)); clip.update(sub_clip(clip,0,u))
             elif self.fixed_video_mode() or clip.get('kind') not in ('freeze','slowmo'):
                 if clip.get('kind')!='slowmo':
                     clock=clip.get('animation_time',start); length=clip.get('animation_duration',duration)
@@ -183,10 +182,10 @@ class TimelineOperations:
         if self.item_locked('video',clip): return
         start,duration=self.video_span(clip); amount=time-start
         if not .05<amount<duration-.05: return
-        self.remember(); source_amount=amount*clip.get('speed',1)
-        if left:
-            clip['source_in']+=source_amount; clip['duration']-=amount; clip['time']=time
-        else: clip['duration']=amount
+        from engine.video_edits import sub_clip
+        self.remember(); u=amount/duration
+        if left: clip.update(sub_clip(clip,u,1)); clip['time']=time
+        else: clip.update(sub_clip(clip,0,u))
         self.changed.emit(); self.resize_content()
 
     def remove_video(self,clip):

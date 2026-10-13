@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt, Signal, QThread, QRectF, QRect, QPointF
 from PySide6.QtGui import QPainter, QColor, QPen, QPainterPath, QImage, QFont, QPixmap
 from PySide6.QtWidgets import QWidget, QScrollArea, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QSlider,QMenu
 from engine.util import FFMPEG, FFPROBE, run, popen
+from engine.video_edits import source_offset
 from .timeline_ops import TimelineOperations
 from .icons import icon
 
@@ -276,7 +277,13 @@ class TrackCanvas(TimelineOperations,QWidget):
         start,duration=span; delta=time-begin; speed=old.get('speed',1)
         if abs(delta)<.0001: return
         self.remember_drag()
+        from engine.video_edits import ramp_points,sub_clip
         if edge=='move': self.move_group(delta)
+        elif ramp_points(old):
+            # A ramped clip can only be shortened; extending would invent speeds outside its curve.
+            if edge=='left':
+                delta=max(0,min(delta,duration-.05)); clip.update(sub_clip(old,delta/duration,1)); clip['time']=old.get('time',0)+delta
+            else: clip.update(sub_clip(old,0,max(.05,min(duration,duration+delta))/duration))
         elif edge=='left':
             delta=max(-old.get('time',0),-old['source_in']/speed if speed else -float('inf'),min(delta,duration-.05))
             clip['time']=old.get('time',0)+delta; clip['source_in']=old['source_in']+delta*speed; clip['duration']=old['duration']-delta
@@ -393,7 +400,7 @@ class TrackCanvas(TimelineOperations,QWidget):
             if self.thumbnails:
                 for x in range(int(rect.x()),int(rect.right())+1,96):
                     out_t=self.time(x)
-                    source=(clip['source_in']+(out_t-start)*clip.get('speed',1)) if clip else self.media_sample(out_t)[0] if self.video_cfg else out_t
+                    source=(clip['source_in']+source_offset(clip,max(0,min(1,(out_t-start)/max(.001,duration))))) if clip else self.media_sample(out_t)[0] if self.video_cfg else out_t
                     img=min(self.thumbnails,key=lambda pair:abs(pair[0]-source))[1]
                     p.drawImage(QRectF(x,rect.y(),96,rect.height()),img)
             if clip:

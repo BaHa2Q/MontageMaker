@@ -6,6 +6,55 @@ def video_span(cfg, info, clip):
     return float(clip.get('time', 0)), float(clip.get('duration', 0))
 
 
+def ramp_points(clip):
+    """Speed keyframes [[fraction of clip, speed], ...] or None for a constant speed."""
+    points = clip.get('speed_points')
+    return points if points and len(points) >= 2 else None
+
+
+def speed_at(points, u):
+    for (a, sa), (b, sb) in zip(points, points[1:]):
+        if u <= b:
+            return sa + (sb - sa) * (u - a) / (b - a) if b > a else sb
+    return points[-1][1]
+
+
+def source_offset(clip, u):
+    """Source seconds consumed from the clip start to output fraction u (area under the speed curve)."""
+    duration = float(clip.get('duration', 0))
+    points = ramp_points(clip)
+    if not points:
+        return u * duration * float(clip.get('speed', 1))
+    total = 0.0
+    for (a, sa), (b, _) in zip(points, points[1:]):
+        if u <= a:
+            break
+        end = min(u, b)
+        total += (end - a) * (sa + speed_at(points, end)) / 2
+    return total * duration
+
+
+def average_speed(points):
+    return source_offset(dict(speed_points=points, duration=1), 1)
+
+
+def cut_points(points, a, b):
+    """Keyframes of the [a, b] part of a clip, rescaled to 0..1."""
+    inner = [[(u - a) / (b - a), v] for u, v in points if a < u < b]
+    return [[0.0, speed_at(points, a)]] + inner + [[1.0, speed_at(points, b)]]
+
+
+def sub_clip(clip, a, b):
+    """Fields for the part of a video clip between output fractions a and b."""
+    data = dict(source_in=clip.get('source_in', 0) + source_offset(clip, a),
+                duration=clip['duration'] * (b - a))
+    points = ramp_points(clip)
+    if points:
+        data['speed_points'] = cut_points(points, a, b)
+        data['speed'] = average_speed(data['speed_points'])
+    return data
+
+
 def effect_duration(clip):
     if clip.get('duration') is not None:
         return float(clip['duration'])
@@ -30,7 +79,14 @@ def validate_video_clips(cfg, info):
         time, source, duration, speed = values
         if speed != 0 and not .1 <= speed <= 4:
             raise ValueError('Invalid video event playback speed.')
-        if time < 0 or not 0 <= source < info['duration'] or duration <= 0 or source + duration * speed > info['duration'] + .01:
+        points = ramp_points(clip)
+        if points:
+            if (any(len(p) != 2 or not all(math.isfinite(float(v)) for v in p) for p in points)
+                    or points[0][0] != 0 or points[-1][0] != 1
+                    or any(b[0] < a[0] for a, b in zip(points, points[1:]))
+                    or not all(.1 <= p[1] <= 4 for p in points)):
+                raise ValueError('Invalid speed ramp.')
+        if time < 0 or not 0 <= source < info['duration'] or duration <= 0 or source + source_offset(clip, 1) > info['duration'] + .01:
             raise ValueError('A video event must use a positive interval inside its source.')
 
 
@@ -44,6 +100,9 @@ def event_plan(cfg, count):
         end = start + length
         videos.append((start, end, (clip.get('source_in', 0) - cfg.trim_start) * fps, clip, float(clip.get('speed', 1))))
         boundaries.update((start, end))
+        if ramp_points(clip) and not clip.get('muted', False):
+            # ponytail: constant-speed steps of 2 frames approximate the curve; smaller steps if ramps look stepped.
+            boundaries.update(range(start, end, 2))
         extent = max(extent, end / fps)
     for clip in cfg.effect_clips or []:
         start = max(0, round(clip.get('time', 0) * fps))
@@ -70,8 +129,14 @@ def event_plan(cfg, count):
                                  output_end=stop, speed=0, clip=None, video_clip=None))
             continue
         vstart, vend, source, vclip, speed = video
+        if ramp_points(vclip):
+            offset = lambda frame: source_offset(vclip, (frame - vstart) / (vend - vstart)) * fps
+            speed = (offset(stop) - offset(start)) / (stop - start)
+            source += offset(start)
+        else:
+            offset = lambda frame, rate=speed: (frame - vstart) * rate
+            source += (start - vstart) * speed
         kind, clip = 'hold' if speed == 0 else 'slowmo' if speed < 1 else 'video', None
-        source += (start - vstart) * speed
         extra = {}
         if active:
             estart, eend, clip = active
@@ -84,7 +149,7 @@ def event_plan(cfg, count):
                 kind = 'slowmo'
                 speed = float(clip.get('speed', clip.get('params', {}).get('speed', .5)))
                 origin = max(estart, vstart)
-                source = video[2] + (origin - vstart) * video[4]
+                source = video[2] + offset(origin)
                 if estart >= vstart and clip.get('source_time') is not None:
                     source = (clip['source_time'] - cfg.trim_start) * fps
                 source += (start - origin) * speed
@@ -108,6 +173,12 @@ def source_output(cfg, source):
                     key=lambda clip: clip.get('time', 0))
     for clip in videos:
         begin, duration, speed = clip.get('source_in', 0), clip.get('duration', 0), clip.get('speed', 1)
+        if ramp_points(clip) and begin <= source < begin + source_offset(clip, 1):
+            low, high = 0.0, 1.0
+            for _ in range(40):
+                middle = (low + high) / 2
+                low, high = (middle, high) if begin + source_offset(clip, middle) < source else (low, middle)
+            return clip.get('time', 0) + low * duration
         if speed == 0 and abs(source - begin) < 1 / cfg.output_fps:
             return float(clip.get('time', 0))
         if begin <= source < begin + duration * speed:

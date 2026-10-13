@@ -111,6 +111,22 @@ class VideoEventTests(unittest.TestCase):
         self.assertAlmostEqual(sample_output(cfg, INFO, 1.5)[0], 3)
         self.assertEqual(sample_output(cfg, INFO, 1.5)[1], 'video')
 
+    def test_speed_ramp_keeps_source_and_changes_gradually(self):
+        from engine.video_edits import sub_clip, source_offset
+        clip = dict(id='ramp', time=0, source_in=1, duration=4, speed=1.25, speed_points=[[0, .5], [1, 2]])
+        cfg = self.config(video=[clip])
+        validate(cfg, INFO)
+        self.assertAlmostEqual(source_offset(clip, 1), 5)
+        early = sample_output(cfg, INFO, .5)[3]['active_segment']['speed']
+        late = sample_output(cfg, INFO, 3.5)[3]['active_segment']['speed']
+        self.assertLess(early, 1)
+        self.assertGreater(late, 1.5)
+        self.assertAlmostEqual(sample_output(cfg, INFO, 4 - 1 / 30)[0], 6, delta=.1)
+        self.assertAlmostEqual(source_to_output(cfg, INFO, 1 + source_offset(clip, .5)), 2, places=3)
+        left, right = dict(clip, **sub_clip(clip, 0, .5)), dict(clip, **sub_clip(clip, .5, 1))
+        self.assertAlmostEqual(source_offset(left, 1) + source_offset(right, 1), 5)
+        self.assertAlmostEqual(right['source_in'], left['source_in'] + source_offset(left, 1))
+
 
 if __name__ == '__main__':
     unittest.main()
