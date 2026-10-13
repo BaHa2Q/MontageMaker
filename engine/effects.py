@@ -4,6 +4,7 @@ import math
 import cv2
 import numpy as np
 from .background import apply_background
+from .motion import Motion
 
 
 def active_effects(cfg, time, kind=None):
@@ -61,7 +62,14 @@ def timed_visuals(frame, cfg, time):
         duration = max(.001, clip.get('animation_duration', clip.get('duration', 1)))
         phase = min(1, max(0, local / duration))
         strength = float(params.get('strength', params.get('motion_strength', .65)))
-        if kind == 'clarity':
+        if kind == 'motion':
+            # Same motion templates as a freeze, applied to the playing video.
+            fps = cfg.output_fps
+            count = max(1, round(duration * fps))
+            k = min(count - 1, max(0, round(local * fps)))
+            frame_u8 = np.clip(out, 0, 255).astype(np.uint8)
+            out = Motion(frame_u8, motion_config(cfg, clip), count).frame(k).astype(np.float32)
+        elif kind == 'clarity':
             sharpness = float(params.get('sharpness', .35)) * strength
             contrast = float(params.get('contrast', 1.05))
             saturation = float(params.get('saturation', 1.08))

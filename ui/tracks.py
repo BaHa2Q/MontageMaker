@@ -16,12 +16,12 @@ from .icons import icon
 
 
 EFFECT_NAMES = {
-    'freeze': 'تجميد وحركة', 'slowmo': 'تباطؤ', 'clarity': 'ألوان ووضوح',
+    'freeze': 'تجميد وحركة', 'slowmo': 'تباطؤ', 'motion': 'حركة', 'clarity': 'ألوان ووضوح',
     'flash': 'فلاش', 'shake': 'اهتزاز', 'glow': 'توهج', 'bars': 'إطار سينمائي',
     'scan': 'مسح ضوئي', 'background': 'خلفية',
 }
 EFFECT_FAMILIES = (
-    ('الحركة والتباطؤ', '#b197ff', ('freeze', 'slowmo')),
+    ('الحركة والتباطؤ', '#b197ff', ('freeze', 'slowmo', 'motion')),
     ('التأثيرات', '#f5bc73', ('clarity', 'flash', 'shake', 'glow', 'bars', 'scan')),
     ('الخلفيات', '#66d7d1', ('background',)),
 )

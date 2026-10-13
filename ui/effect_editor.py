@@ -9,7 +9,7 @@ from engine.templates import MOTION_TEMPLATES
 from engine.sound import builtin_sound
 from .panels import Section
 
-EFFECT_NAMES={'freeze':'تجميد وحركة','slowmo':'تباطؤ','clarity':'ألوان ووضوح','flash':'فلاش','shake':'اهتزاز','glow':'وهج','scan':'مسح ضوئي','bars':'أشرطة سينما','background':'خلفية'}
+EFFECT_NAMES={'freeze':'تجميد وحركة','slowmo':'تباطؤ','motion':'حركة','clarity':'ألوان ووضوح','flash':'فلاش','shake':'اهتزاز','glow':'وهج','scan':'مسح ضوئي','bars':'أشرطة سينما','background':'خلفية'}
 
 def spin(value=0,minimum=0,maximum=86400,suffix=' ث'):
     w=QDoubleSpinBox(); w.setRange(minimum,maximum); w.setDecimals(3); w.setSingleStep(.1); w.setSuffix(suffix); w.setValue(value); return w
@@ -19,7 +19,7 @@ class EffectEditor:
         return getattr(self.audio_timeline.canvas,'video_clips',None) is not None
 
     def effect_lane(self,kind):
-        return 'motion' if kind in ('freeze','slowmo') else 'background' if kind=='background' else 'visual'
+        return 'motion' if kind in ('freeze','slowmo','motion') else 'background' if kind=='background' else 'visual'
 
     def effect_lane_locked(self,kind):
         return self.audio_timeline.canvas.lane_states.get(self.effect_lane(kind),{}).get('locked',False)
@@ -91,7 +91,7 @@ class EffectEditor:
             clip=self.selected_effect(); has=clip is not None; kind=clip['kind'] if clip else ''
             controls=(self.effect_name,self.effect_time,self.effect_length,self.effect_source,self.effect_source_length,self.effect_enabled,self.effect_locked,self.effect_style,self.effect_angle,self.effect_direction,self.effect_speed,self.effect_strength,self.effect_contrast,self.effect_saturation,self.effect_sharpness)
             for w in controls: w.setEnabled(has)
-            self.effect_motion.setVisible(kind=='freeze'); self.effect_slow.setVisible(kind=='slowmo'); self.effect_look.setVisible(kind=='clarity'); self.effect_bg_note.setVisible(kind=='background'); self.effect_strength_box.setVisible(kind not in ('slowmo','background',''))
+            self.effect_motion.setVisible(kind in ('freeze','motion')); self.effect_slow.setVisible(kind=='slowmo'); self.effect_look.setVisible(kind=='clarity'); self.effect_bg_note.setVisible(kind=='background'); self.effect_strength_box.setVisible(kind not in ('slowmo','background',''))
             self.effect_timing_form.setRowVisible(self.effect_source,kind in ('freeze','slowmo')); self.effect_timing_form.setRowVisible(self.effect_source_length,kind=='slowmo')
             if clip:
                 p=clip.get('params',{}); start,length=effect_span(self.config(),self.info,clip)
@@ -153,6 +153,7 @@ class EffectEditor:
                 if available is None or abs(available-desired)>1e-6:
                     clip.clear(); clip.update(old); self.refresh_effect_fields(); self.status.setText('الجزء المحدد يتداخل مع تباطؤ آخر؛ اختَر جزءًا مختلفًا.'); return
         elif not fixed or sender is self.effect_length or 'duration' not in clip: clip['duration']=self.effect_length.value()
+        if clip['kind']=='motion': p.update(motion_style=self.effect_style.currentData(),orbit_angle=self.effect_angle.value(),rotation_direction=self.effect_direction.currentData(),motion_strength=self.effect_strength.value()/100)
         if clip['kind']=='clarity': p.update(contrast=self.effect_contrast.value(),saturation=self.effect_saturation.value(),sharpness=self.effect_sharpness.value())
         if fixed:
             if sender is self.effect_time and 'animation_time' in clip:

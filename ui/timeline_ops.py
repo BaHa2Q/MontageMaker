@@ -12,7 +12,7 @@ class TimelineOperations:
         if kind=='video': return 'video'
         if kind=='effect':
             name=(clip or {}).get('kind')
-            return 'motion' if name in ('freeze','slowmo') else 'background' if name=='background' else 'visual'
+            return 'motion' if name in ('freeze','slowmo','motion') else 'background' if name=='background' else 'visual'
         return None
 
     def lane_state(self,key):

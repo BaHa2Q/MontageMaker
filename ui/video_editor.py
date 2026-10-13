@@ -18,7 +18,8 @@ class VideoEditor:
             w.valueChanged.connect(self.video_fields_changed); return w
         self.video_time=field(); self.video_in=field(); self.video_length=field()
         self.video_length.setMinimum(.05)
-        for text,w in [('مكانه على المسار',self.video_time),('بداية الأصل',self.video_in),('مدة المقطع',self.video_length)]: form.addRow(text,w)
+        self.video_speed=field(); self.video_speed.setRange(.1,4); self.video_speed.setSuffix(' ×'); self.video_speed.setValue(1)
+        for text,w in [('مكانه على المسار',self.video_time),('بداية الأصل',self.video_in),('مدة المقطع',self.video_length),('السرعة',self.video_speed)]: form.addRow(text,w)
         self.video_section.box.addLayout(form); row=QHBoxLayout()
         self.video_mute=QCheckBox('إخفاء المقطع'); self.video_lock=QCheckBox('قفل المقطع')
         for w in (self.video_mute,self.video_lock): w.toggled.connect(self.video_fields_changed); row.addWidget(w)
@@ -40,15 +41,16 @@ class VideoEditor:
         if not hasattr(self,'video_time'): return
         self.syncing_video=True
         try:
-            clip=self.selected_video(); controls=(self.video_time,self.video_in,self.video_length,self.video_mute,self.video_lock)
+            clip=self.selected_video(); controls=(self.video_time,self.video_in,self.video_length,self.video_speed,self.video_mute,self.video_lock)
             for w in controls: w.setEnabled(clip is not None)
             if clip:
                 self.video_time.setValue(clip.get('time',0)); self.video_in.setMaximum(max(0,self.info['duration']-.05)); self.video_in.setValue(clip['source_in'])
                 speed=clip.get('speed',1)
+                self.video_speed.setEnabled(bool(speed)); self.video_speed.setValue(speed or 1)
                 self.video_length.setMaximum((self.info['duration']-clip['source_in'])/speed if speed else 86400)
                 self.video_length.setValue(clip['duration']); self.video_mute.setChecked(clip.get('muted',False)); self.video_lock.setChecked(clip.get('locked',False))
                 if self.audio_timeline.canvas.item_locked('video',clip):
-                    for w in (self.video_time,self.video_in,self.video_length): w.setEnabled(False)
+                    for w in (self.video_time,self.video_in,self.video_length,self.video_speed): w.setEnabled(False)
                 if self.lane_states.get('video',{}).get('locked'):
                     for w in controls: w.setEnabled(False)
         finally: self.syncing_video=False
@@ -59,10 +61,23 @@ class VideoEditor:
         if not clip: return
         if self.lane_states.get('video',{}).get('locked'): self.refresh_video_fields(); return
         if clip.get('locked') and self.sender() is not self.video_lock: self.refresh_video_fields(); return
-        self.audio_timeline.canvas.remember(); speed=clip.get('speed',1); source=self.video_in.value()
+        self.audio_timeline.canvas.remember()
+        if self.sender() is self.video_speed and clip.get('speed',1):
+            self.change_video_speed(clip,self.video_speed.value())
+            self.pause_live(); self.live_audio.discontinuity(); self.refresh_video_fields(); self.clips_changed(); return
+        speed=clip.get('speed',1); source=self.video_in.value()
         maximum=(self.info['duration']-source)/speed if speed else 86400
         clip.update(time=self.video_time.value(),source_in=source,duration=max(.05,min(self.video_length.value(),maximum)),muted=self.video_mute.isChecked(),locked=self.video_lock.isChecked())
         self.pause_live(); self.live_audio.discontinuity(); self.refresh_video_fields(); self.invalidate()
+
+    def change_video_speed(self,clip,speed):
+        """Keep the same source footage; its timeline length and linked source audio follow the speed."""
+        old=clip.get('speed',1); ratio=old/speed; start=clip.get('time',0); end=start+clip['duration']
+        # ponytail: source audio is matched by path and position, not an explicit link; split audio separately if needed.
+        for audio in self.audio_clips:
+            if audio.get('source_audio') and audio['path']==self.video and not audio.get('locked') and start-.001<=audio['time'] and audio['time']+audio['duration']<=end+.001:
+                audio['time']=start+(audio['time']-start)*ratio; audio['duration']*=ratio; audio['rate']=audio.get('rate',1)/ratio
+        clip['speed']=speed; clip['duration']=max(.05,clip['duration']*ratio)
 
     def seed_video(self):
         self.video_clips[:]=[dict(id=uuid.uuid4().hex,name=os.path.basename(self.video),time=0,source_in=0,duration=self.info['duration'],muted=False,locked=False)]

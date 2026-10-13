@@ -28,7 +28,7 @@ def validate_video_clips(cfg, info):
         if not all(math.isfinite(float(value)) for value in values):
             raise ValueError('Video event positions must be finite numbers.')
         time, source, duration, speed = values
-        if speed != 0 and not .1 <= speed <= 1:
+        if speed != 0 and not .1 <= speed <= 4:
             raise ValueError('Invalid video event playback speed.')
         if time < 0 or not 0 <= source < info['duration'] or duration <= 0 or source + duration * speed > info['duration'] + .01:
             raise ValueError('A video event must use a positive interval inside its source.')

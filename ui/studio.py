@@ -311,7 +311,7 @@ class StudioFeatures(VideoEditor,EffectEditor):
         elif key=='export': self.sidebar.setCurrentIndex(3)
 
     def choose_motion(self,key):
-        self.add_effect('freeze',params=dict(motion_style=key,orbit_angle=360,rotation_direction=1,motion_strength=.65))
+        self.add_effect('motion',params=dict(motion_style=key,orbit_angle=360,rotation_direction=1,motion_strength=.65))
 
     def select_video(self):
         self.inspector_caption.setText('خصائص الفيديو'); self.sidebar.setCurrentIndex(0)
@@ -371,7 +371,7 @@ class StudioFeatures(VideoEditor,EffectEditor):
         if self.lane_states.get('video',{}).get('hidden'):
             for clip in cfg.video_clips: clip['muted']=True
         for clip in cfg.effect_clips:
-            key='motion' if clip['kind'] in ('freeze','slowmo') else 'background' if clip['kind']=='background' else 'visual'
+            key='motion' if clip['kind'] in ('freeze','slowmo','motion') else 'background' if clip['kind']=='background' else 'visual'
             if self.lane_states.get(key,{}).get('hidden'): clip['muted']=True
         cfg.sound_effects=copy.deepcopy(self.audio_clips)
         cfg.audio_tracks=copy.deepcopy(self.audio_tracks)

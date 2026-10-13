@@ -94,6 +94,23 @@ class VideoEventTests(unittest.TestCase):
         frame = np.full((24, 32, 3), 60, np.uint8)
         np.testing.assert_array_equal(timed_visuals(frame, cfg, 2.5), timed_visuals(frame, split, 2.5))
 
+    def test_motion_effect_moves_playing_video_without_freeze(self):
+        event = dict(id='spin', kind='motion', time=1, duration=2,
+                     params=dict(motion_style='spin', orbit_angle=180, rotation_direction=1, motion_strength=.65))
+        cfg = self.config(effects=[event])
+        validate(cfg, INFO)
+        self.assertEqual(timeline(cfg, 240)['total_frames'], 240)
+        self.assertAlmostEqual(sample_output(cfg, INFO, 2)[0], 2)
+        frame = np.arange(24 * 32 * 3, dtype=np.uint8).reshape(24, 32, 3)
+        self.assertFalse(np.array_equal(timed_visuals(frame, cfg, 2), frame))
+        np.testing.assert_array_equal(timed_visuals(frame, cfg, 4), frame)
+
+    def test_fast_video_event_skips_source(self):
+        cfg = self.config(video=[dict(id='fast', time=0, source_in=0, duration=2, speed=2)])
+        validate(cfg, INFO)
+        self.assertAlmostEqual(sample_output(cfg, INFO, 1.5)[0], 3)
+        self.assertEqual(sample_output(cfg, INFO, 1.5)[1], 'video')
+
 
 if __name__ == '__main__':
     unittest.main()

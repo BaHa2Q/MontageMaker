@@ -230,7 +230,7 @@ def timeline(cfg, count):
                 resume=(before + ro + motion) / fps, ramp=before / fps, duration=total / fps)
 
 
-EFFECT_KINDS = ('freeze', 'slowmo', 'clarity', 'flash', 'shake', 'glow', 'bars', 'scan', 'background')
+EFFECT_KINDS = ('freeze', 'slowmo', 'motion','clarity', 'flash', 'shake', 'glow', 'bars', 'scan', 'background')
 MOTION_STYLES = ('spin', 'hold', 'pulse', 'glitch', 'focus', 'tilt', 'scan')
 BACKGROUND_STYLES = ('none', 'particles', 'snow', 'embers', 'bokeh', 'rain', 'stars',
                      'neon', 'grid', 'aurora', 'rays', 'vignette', 'media')
@@ -285,6 +285,8 @@ def _validate_effects(cfg, end, info=None):
                 if params.get('rotation_direction', cfg.rotation_direction) not in (-1, 1):
                     raise ValueError('Invalid rotation direction.')
         else:
+            if kind == 'motion' and params.get('motion_style', cfg.motion_style) not in MOTION_STYLES:
+                raise ValueError('Invalid motion template.')
             if not _finite(clip.get('time', 0)) or clip.get('time', 0) < 0:
                 raise ValueError('Effect times cannot be negative.')
             if not _finite(clip.get('duration', 1)) or clip.get('duration', 1) <= 0:
