@@ -1,4 +1,4 @@
-﻿"""Startup update check; a separate updater window downloads and installs after the editor closes."""
+"""Startup update check; a separate updater window downloads and installs after the editor closes."""
 import hashlib
 import json
 import os
