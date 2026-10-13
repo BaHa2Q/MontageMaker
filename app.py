@@ -820,6 +820,9 @@ def main():
     if len(sys.argv) == 4 and sys.argv[1] == '--self-test':
         from engine.verify import verify_distribution
         return 0 if verify_distribution(sys.argv[2], sys.argv[3]) else 1
+    if len(sys.argv) == 5 and sys.argv[1] == '--update':
+        from ui.updater import run_update_window
+        return run_update_window(*sys.argv[2:])
     window = Studio()
     if len(sys.argv)==3 and sys.argv[1]=='--open' and os.path.isfile(sys.argv[2]):
         try:
