@@ -58,6 +58,16 @@ class TimelineOperations:
         right=min([s for s,d in spans if s>=start+duration-1e-6],default=float('inf'))
         return left,right
 
+    def make_room(self,kind,clip):
+        """Push the clips after a newly placed clip along its lane so nothing overlaps."""
+        span=self.video_span if kind=='video' else lambda c:(c['time'],c['duration'])
+        lane=self.item_list(kind) if kind=='video' else [c for c in self.clips if c.get('track')==clip.get('track')]
+        start,duration=span(clip); end=start+duration
+        for other in sorted((c for c in lane if c is not clip and span(c)[0]>=start-1e-6),key=lambda c:span(c)[0]):
+            s,d=span(other)
+            if s<end-1e-6: other['time']=end; s=end
+            end=s+d
+
     def is_selected(self,kind,ident):
         return (kind,ident) in self.selection
 
@@ -185,6 +195,7 @@ class TimelineOperations:
             duplicate=copy.deepcopy(clip); duplicate['id']=uuid.uuid4().hex; duplicate['time']=start+duration
             if kind=='effect' and 'animation_time' in duplicate: duplicate['animation_time']+=duration
             self.item_list(kind).append(duplicate); selected.add((kind,duplicate['id']))
+            if kind!='effect': self.make_room(kind,duplicate)
         self.selection=selected; self.sync_selection(); self.changed.emit(); self.resize_content(); return True
 
     def trim_video(self,clip,time,left):

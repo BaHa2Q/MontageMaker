@@ -154,11 +154,15 @@ class LiveAudio(QObject):
             offset=cfg.drop_in_song-plan['resume'] if cfg.drop_in_song is not None else cfg.music_start
             self.sync_voice('music',cfg.music,time+offset,cfg.music_volume,playing,not cfg.music_muted)
         tracks={str(track['id']):track for track in cfg.audio_tracks}
+        playing_now=lambda c,t:time-c['time']<(c.get('duration') or plan['duration']) and time>=c['time'] and not c.get('muted') and not t.get('muted')
+        # Background tracks duck to 30% while anything else is audible (the render ducks by loudness).
+        foreground=(game_enabled and info['audio'] and game_active) or bool(cfg.music and not cfg.music_muted) or any(
+            playing_now(c,tracks.get(str(c.get('track')),{})) for c in cfg.sound_effects if not tracks.get(str(c.get('track')),{}).get('background'))
         for i,clip in enumerate(cfg.sound_effects):
             track=tracks.get(str(clip.get('track')), {})
             ident=clip.get('id',str(i)); active.add(ident)
             elapsed=time-clip['time']; duration=clip.get('duration') or plan['duration']
-            gain=clip['volume']*track.get('volume',1)
+            gain=clip['volume']*track.get('volume',1)*(.3 if track.get('background') and foreground else 1)
             if clip.get('fade_in'): gain*=min(1,max(0,elapsed/clip['fade_in']))
             if clip.get('fade_out'): gain*=min(1,max(0,(duration-elapsed)/clip['fade_out']))
             rate=clip.get('rate',1)

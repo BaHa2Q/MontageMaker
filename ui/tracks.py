@@ -743,7 +743,7 @@ class TrackCanvas(TimelineOperations,QWidget):
         else: clip['duration']=delta
         self.changed.emit(); self.resize_content()
     def duplicate(self,clip):
-        self.remember(); new=copy.deepcopy(clip); new['id']=uuid.uuid4().hex; new['time']+=new['duration']; self.clips.append(new); self.changed.emit(); self.resize_content()
+        self.remember(); new=copy.deepcopy(clip); new['id']=uuid.uuid4().hex; new['time']+=new['duration']; self.clips.append(new); self.make_room('audio',new); self.changed.emit(); self.resize_content()
     def change_flag(self,item,key,value):
         if not self.fixed_video_mode() and key=='muted' and not value and item.get('kind')=='slowmo':
             candidate=copy.deepcopy(item); candidate['muted']=False

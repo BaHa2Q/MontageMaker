@@ -162,6 +162,7 @@ def make_soundtrack(total, t_ramp, t_freeze, t_resume, orbit_end, music_path, ga
     # Imported clips use their own fades; the automatic tail is for built-in audio only.
     end_fade = np.clip((M - np.arange(M)) / (0.7 * SR), 0, 1)
     if legacy_treatment: mix = mix * end_fade[:, None]
+    background = np.zeros_like(mix)
     for effect in custom_effects or []:
         path, start, volume = effect[:3]
         fade_in, fade_out = effect[3:5] if len(effect) >= 5 else (0, 0)
@@ -184,7 +185,13 @@ def make_soundtrack(total, t_ramp, t_freeze, t_resume, orbit_end, music_path, ga
         if fade_out:
             envelope *= np.clip((len(clip) / SR - samples) / fade_out, 0, 1)
         clip *= envelope[:, None]
-        mix[offset:offset + len(clip)] += clip * volume
+        target = background if len(effect) > 6 and effect[6] else mix
+        target[offset:offset + len(clip)] += clip * volume
+    if background.any():
+        # Background tracks drop to 30% wherever any other sound plays, with ~0.3 s glides.
+        from scipy.ndimage import uniform_filter1d
+        smooth = lambda x: uniform_filter1d(x, int(.3 * SR))
+        mix += background * smooth(np.where(smooth(np.abs(mix).max(axis=1)) > .02, .3, 1.))[:, None]
 
     mix = np.tanh(mix * 1.1) / np.tanh(1.1)
     mix /= max(1.0, np.abs(mix).max() / 0.95)

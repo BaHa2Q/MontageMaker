@@ -248,6 +248,7 @@ class StudioFeatures(VideoEditor,EffectEditor):
         row=QHBoxLayout(); self.track_mute=QCheckBox('كتم المسار'); self.track_lock=QCheckBox('قفل المسار')
         for w in (self.track_mute,self.track_lock): w.toggled.connect(self.track_fields_changed); row.addWidget(w)
         self.track_section.box.addLayout(row)
+        self.track_background=QCheckBox('صوت خلفية: يوطى لحاله لما يكون في صوت تاني'); self.track_background.toggled.connect(self.track_fields_changed); self.track_section.box.addWidget(self.track_background)
         self.clip_section=Section('المقطع المحدد',True); box.addWidget(self.clip_section)
         self.clip_combo=QComboBox(); self.clip_combo.currentIndexChanged.connect(self.audio_combo_changed); self.clip_section.box.addWidget(self.clip_combo)
         form=QFormLayout(); self.clip_time=seconds(); self.clip_in=seconds(); self.clip_out=seconds()
@@ -349,17 +350,17 @@ class StudioFeatures(VideoEditor,EffectEditor):
     def refresh_track_fields(self):
         if not hasattr(self,'track_name'): return
         self.syncing_track=True; track=self.audio_timeline.canvas.track_info(self.selected_track_id)
-        for w in (self.track_name,self.track_volume,self.track_mute,self.track_lock): w.setEnabled(bool(track))
+        for w in (self.track_name,self.track_volume,self.track_mute,self.track_lock,self.track_background): w.setEnabled(bool(track))
         if track.get('locked'):
-            for w in (self.track_name,self.track_volume,self.track_mute): w.setEnabled(False)
-        self.track_name.setText(track.get('name','')); self.track_volume.setValue(round(track.get('volume',1)*100)); self.track_mute.setChecked(track.get('muted',False)); self.track_lock.setChecked(track.get('locked',False)); self.syncing_track=False
+            for w in (self.track_name,self.track_volume,self.track_mute,self.track_background): w.setEnabled(False)
+        self.track_name.setText(track.get('name','')); self.track_volume.setValue(round(track.get('volume',1)*100)); self.track_mute.setChecked(track.get('muted',False)); self.track_lock.setChecked(track.get('locked',False)); self.track_background.setChecked(track.get('background',False)); self.syncing_track=False
 
     def track_fields_changed(self,*args):
         if self.syncing_track: return
         track=self.audio_timeline.canvas.track_info(self.selected_track_id)
         if not track: return
         if track.get('locked') and self.sender() is not self.track_lock: self.refresh_track_fields(); return
-        self.audio_timeline.canvas.remember(); track.update(name=self.track_name.text() or 'صوت',volume=self.track_volume.value()/100,muted=self.track_mute.isChecked(),locked=self.track_lock.isChecked())
+        self.audio_timeline.canvas.remember(); track.update(name=self.track_name.text() or 'صوت',volume=self.track_volume.value()/100,muted=self.track_mute.isChecked(),locked=self.track_lock.isChecked(),background=self.track_background.isChecked())
         self.refresh_audio_fields(); self.invalidate()
 
     def redo_audio(self):
@@ -709,6 +710,7 @@ class StudioFeatures(VideoEditor,EffectEditor):
         source['track']=self.add_track_model(source.get('track') if source.get('track') is not None else self.pending_audio_track)
         self.library.add_file(path,'audio')
         self.audio_clips.append(source); self.analyze(path)
+        if not item: self.audio_timeline.canvas.make_room('audio',source)
 
     def selected_clip(self):
         ident=self.audio_timeline.canvas.selected_id

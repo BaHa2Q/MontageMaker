@@ -127,7 +127,7 @@ def run_montage(cfg, log=print, progress=lambda f: None, cancel=None):
             rate = item.get('rate', 1)
             dest = audio(item['path'], os.path.join(work, f'fx_{i}.wav'),
                          start=item.get('source_in', 0), duration=length * rate)
-            effects.append((dest, item['time'], item['volume']*track.get('volume',1), item.get('fade_in', 0), item.get('fade_out', 0), rate))
+            effects.append((dest, item['time'], item['volume']*track.get('volume',1), item.get('fade_in', 0), item.get('fade_out', 0), rate, bool(track.get('background'))))
         if timeline_editor:
             segments = [(s['output_start'] / fps, s['source_start'] / fps + cfg.trim_start - source_start,
                          (s['output_end'] - s['output_start']) / fps, 0, 0, s['speed'])
