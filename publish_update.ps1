@@ -1,9 +1,19 @@
-# Build the installer and publish it as the latest GitHub release.
-# 1. Raise VERSION in ui\updater.py   2. Commit and push   3. Run: .\publish_update.ps1 -Notes "what changed"
-param([string]$Notes = '', [string]$Repo = 'BaHa2Q/MontageMaker')
+# Set the version, push the code, build the installer and publish it as the latest GitHub release.
+# Usually run through publish.bat.
+param([string]$Version = '', [string]$Notes = '', [string]$Repo = 'BaHa2Q/MontageMaker')
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
+if ($Version) {
+    if ($Version -notmatch '^\d+(\.\d+)+$') { throw "Version must look like 4.4" }
+    $text = [IO.File]::ReadAllText("$PWD\ui\updater.py")
+    [IO.File]::WriteAllText("$PWD\ui\updater.py", ($text -replace "VERSION = '[\d.]+'", "VERSION = '$Version'"), (New-Object Text.UTF8Encoding $false))
+}
 $version = (Select-String -Path ui\updater.py -Pattern "^VERSION = '(.+)'").Matches[0].Groups[1].Value
+git add -A
+git diff --cached --quiet
+if ($LASTEXITCODE) { git commit -m "Release $version"; if ($LASTEXITCODE) { throw 'git commit failed.' } }
+git push
+if ($LASTEXITCODE) { throw 'git push failed.' }
 $python = '.\venv\Scripts\python.exe'
 & $python -m pip install -q PyInstaller==6.22.3
 & $python -m PyInstaller --noconfirm --clean --onedir --windowed --name MontageMaker --icon assets\montage.ico --add-data "assets;assets" --add-data "ffmpeg\bin;ffmpeg\bin" launcher.py
